@@ -1,3 +1,6 @@
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -17,6 +20,7 @@ use crate::core::transport::ConnectionInterface;
 use crate::core::transport::TransportInterface;
 use crate::core::transport::TransportMessage;
 use crate::core::transport::WebrtcConnectionState;
+use crate::delivery::DeliveryFuture;
 use crate::error::Error;
 use crate::error::Result;
 use crate::ice_server::IceServer;
@@ -32,6 +36,61 @@ const SEND_MESSAGE_DELAY: bool = true;
 
 lazy_static! {
     static ref CONNS: DashMap<String, Arc<DummyConnection>> = DashMap::new();
+}
+
+thread_local! {
+    /// Per-(test-)thread controlled-delivery state. THREAD-LOCAL on purpose: the
+    /// flag and queue are scoped to the current thread so a controlled test is
+    /// isolated from any other dummy test running in parallel. With the default
+    /// current-thread `#[tokio::test]` runtime, all of a test's dummy activity
+    /// (its connections' event listeners, sends, and the cascaded handlers) runs
+    /// on that one thread — so only that test ever sees `CONTROLLED == true`, and
+    /// only its events land in its own `DELIVERY` queue. Other tests, on other
+    /// threads, keep auto-dispatching as usual.
+    static CONTROLLED: Cell<bool> = const { Cell::new(false) };
+    /// Test-only controlled delivery queue: `(target connection rand_id, event)`,
+    /// populated instead of auto-dispatching while `CONTROLLED` is on.
+    static DELIVERY: RefCell<VecDeque<(String, Event)>> = RefCell::new(VecDeque::new());
+}
+
+/// Test-only controlled delivery scheduler. When enabled (per thread), dummy
+/// message/event delivery is queued instead of auto-dispatched, so a test can
+/// drive the exact ordering and deterministically explore the timing-state space
+/// (see `rings_core`'s `tests::default::dht_schedule`). Off by default; no effect
+/// on normal runs.
+pub mod controlled {
+    use super::CONNS;
+    use super::CONTROLLED;
+    use super::DELIVERY;
+
+    /// Turn the controlled scheduler on/off for the current thread. Turning it
+    /// off clears this thread's queue.
+    pub fn enable(on: bool) {
+        CONTROLLED.with(|c| c.set(on));
+        if !on {
+            DELIVERY.with(|q| q.borrow_mut().clear());
+        }
+    }
+
+    /// Number of events currently queued on the current thread.
+    pub fn pending() -> usize {
+        DELIVERY.with(|q| q.borrow().len())
+    }
+
+    /// Deliver the queued event at `index` to its target connection — invoking
+    /// the real handler, which may enqueue further events. Returns false if the
+    /// index is out of range or the target connection is gone.
+    pub async fn deliver(index: usize) -> bool {
+        let entry = DELIVERY.with(|q| q.borrow_mut().remove(index));
+        let Some((rand_id, event)) = entry else {
+            return false;
+        };
+        let Some(conn) = CONNS.get(&rand_id).map(|c| c.clone()) else {
+            return false;
+        };
+        conn.handle_event(event).await;
+        true
+    }
 }
 
 enum Event {
@@ -68,7 +127,13 @@ impl DummyConnection {
             let rand_id = rand_id.clone();
             tokio::spawn(async move {
                 while let Some(ev) = rx.recv().await {
-                    let conn = { CONNS.get(&rand_id).unwrap().clone() };
+                    // The connection may already have been closed and removed
+                    // from the global map while events were still queued (a
+                    // disconnect racing with close()/abort()). Stop draining
+                    // instead of panicking on the missing entry.
+                    let Some(conn) = CONNS.get(&rand_id).map(|c| c.clone()) else {
+                        break;
+                    };
                     conn.handle_event(ev).await;
                 }
             })
@@ -90,7 +155,7 @@ impl DummyConnection {
                 self.callback.on_peer_connection_state_change(state).await
             }
             Event::DataChannelOpen => self.callback.on_data_channel_open().await,
-            Event::DataChannelClose => self.callback.on_data_channel_close(),
+            Event::DataChannelClose => self.callback.on_data_channel_close().await,
             Event::Message(data) => {
                 if SEND_MESSAGE_DELAY {
                     random_delay().await;
@@ -104,12 +169,28 @@ impl DummyConnection {
         let Some(cid) = { self.remote_rand_id.lock().unwrap() }.clone() else {
             return None;
         };
-        Some(CONNS.get(&cid).unwrap().clone())
+        // The remote may already have been closed and removed from the global
+        // map (e.g. during a disconnect). Return None instead of panicking, so
+        // callers treat it like a closed connection.
+        CONNS.get(&cid).map(|c| c.clone())
     }
 
     fn set_remote_rand_id(&self, rand_id: String) {
         let mut remote_rand_id = self.remote_rand_id.lock().unwrap();
         *remote_rand_id = Some(rand_id);
+    }
+
+    /// Route an event to this connection's listener — or, when the test-only
+    /// controlled scheduler is on, into [`DELIVERY`] for a test to deliver
+    /// explicitly. Returns whether the event was accepted (the listener may be
+    /// gone during teardown).
+    fn dispatch(&self, event: Event) -> bool {
+        if CONTROLLED.with(|c| c.get()) {
+            DELIVERY.with(|q| q.borrow_mut().push_back((self.rand_id.clone(), event)));
+            true
+        } else {
+            self.event_sender.send(event).is_ok()
+        }
     }
 
     async fn set_webrtc_connection_state(&self, state: WebrtcConnectionState) {
@@ -123,19 +204,17 @@ impl DummyConnection {
             *webrtc_connection_state = state;
         }
 
-        self.event_sender
-            .send(Event::PeerConnectionStateChange(state))
-            .unwrap();
+        self.dispatch(Event::PeerConnectionStateChange(state));
 
         if state == WebrtcConnectionState::Connected {
-            self.event_sender.send(Event::DataChannelOpen).unwrap();
+            self.dispatch(Event::DataChannelOpen);
         }
 
         if matches!(
             state,
             WebrtcConnectionState::Closed | WebrtcConnectionState::Disconnected
         ) {
-            self.event_sender.send(Event::DataChannelClose).unwrap();
+            self.dispatch(Event::DataChannelClose);
         }
     }
 }
@@ -154,17 +233,26 @@ impl ConnectionInterface for DummyConnection {
     type Sdp = String;
     type Error = Error;
 
-    async fn send_message(&self, msg: TransportMessage) -> Result<()> {
+    async fn send_message(&self, msg: TransportMessage) -> Result<DeliveryFuture> {
         self.webrtc_wait_for_data_channel_open().await?;
 
         let data = bincode::serialize(&msg).map(Bytes::from)?;
-        self.remote_conn()
-            .unwrap()
-            .event_sender
-            .send(Event::Message(data))
-            .unwrap();
+        // The remote connection may have been torn down between the data
+        // channel check and here (the dummy analogue of sending on a channel
+        // that just closed). Mimic a real transport: fail gracefully instead of
+        // panicking.
+        let remote = self.remote_conn().ok_or_else(|| {
+            Error::MessageNotDelivered("dummy remote connection is gone".to_string())
+        })?;
+        if !remote.dispatch(Event::Message(data)) {
+            return Err(Error::MessageNotDelivered(
+                "dummy remote connection is closed".to_string(),
+            ));
+        }
 
-        Ok(())
+        // The dummy backend delivers synchronously in-memory, so delivery is
+        // immediately complete.
+        Ok(Box::pin(async { Ok(()) }))
     }
 
     fn webrtc_connection_state(&self) -> WebrtcConnectionState {

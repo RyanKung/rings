@@ -20,6 +20,7 @@ redundant = ["default"]
 std = [
     "webrtc",
     "sled",
+    "tokio",
     "uuid/v4",
     "uuid/serde",
     "rings-derive/default",
@@ -123,4 +124,7 @@ tracing-wasm = "0.2.1"
 wasm-bindgen-test = { workspace = true }
 
 [target.'cfg(not(target_family="wasm"))'.dev-dependencies]
+# Model checker — pulls getrandom/tiny_http, which don't build for wasm32, so
+# it (and the dht_stateright module that uses it) is non-wasm only.
+stateright = "0.31.0"
 tokio = { version = "1.13.0", features = ["full"] }

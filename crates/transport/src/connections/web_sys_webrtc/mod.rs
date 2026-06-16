@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -32,6 +34,7 @@ use crate::core::transport::ConnectionInterface;
 use crate::core::transport::TransportInterface;
 use crate::core::transport::TransportMessage;
 use crate::core::transport::WebrtcConnectionState;
+use crate::delivery::DeliveryFuture;
 use crate::error::Error;
 use crate::error::Result;
 use crate::ice_server::IceCredentialType;
@@ -44,12 +47,55 @@ const WEBRTC_GATHER_TIMEOUT: u8 = 60; // seconds
 /// pool size of data channel
 const DATA_CHANNEL_POOL_SIZE: u8 = 4;
 
+/// How often the delivery future re-checks whether a message has been flushed.
+const DELIVERY_POLL_INTERVAL_MS: u64 = 300;
+
+/// A data channel paired with a monotonic counter of the total bytes ever
+/// enqueued onto it. See the native backend for the rationale; the counter
+/// lets the delivery future tell, per message, whether the bytes have left the
+/// local send buffer (`enqueued_total - buffered_amount`).
+type TrackedChannel = (RtcDataChannel, Arc<AtomicU64>);
+
+/// Build the future that resolves once the message ending at `end_offset` on
+/// this channel has been flushed to the wire, or errors if the channel closes
+/// first. It re-checks on a timer, driving its own wake-ups.
+fn delivery_future(
+    channel: RtcDataChannel,
+    enqueued: Arc<AtomicU64>,
+    end_offset: u64,
+) -> DeliveryFuture {
+    Box::pin(async move {
+        loop {
+            let buffered = channel.buffered_amount() as u64;
+            if enqueued.load(Ordering::SeqCst).saturating_sub(buffered) >= end_offset {
+                return Ok(());
+            }
+            if matches!(
+                channel.ready_state(),
+                RtcDataChannelState::Closing | RtcDataChannelState::Closed
+            ) {
+                return Err(Error::MessageNotDelivered(
+                    "data channel closed before the message was flushed".to_string(),
+                ));
+            }
+            let notifier = Notifier::default();
+            notifier.set_timeout_ms(DELIVERY_POLL_INTERVAL_MS);
+            notifier.await;
+        }
+    })
+}
+
 #[async_trait(?Send)]
-impl MessageSenderPool<RtcDataChannel> for RoundRobinPool<RtcDataChannel> {
+impl MessageSenderPool<TrackedChannel> for RoundRobinPool<TrackedChannel> {
     type Message = TransportMessage;
-    async fn send(&self, msg: TransportMessage) -> Result<()> {
-        let channel = self.select()?;
+    async fn send(&self, msg: TransportMessage) -> Result<DeliveryFuture> {
+        let (channel, enqueued) = self.select()?;
         let data = bincode::serialize(&msg)?;
+        // `send_with_u8_array` is synchronous, so there's no interleaving to
+        // guard; just advance `enqueued` ONLY after a successful send. Advancing
+        // first would, on a rejected send, leave the counter ahead of the bytes
+        // actually buffered, making earlier messages' delivery futures resolve
+        // early on phantom bytes (`enqueued_total - buffered_amount`).
         if let Err(e) = channel
             .send_with_u8_array(&data)
             .map_err(Error::WebSysWebrtc)
@@ -57,13 +103,15 @@ impl MessageSenderPool<RtcDataChannel> for RoundRobinPool<RtcDataChannel> {
             tracing::error!("{:?}, Data size: {:?}", e, data.len());
             return Err(e.into());
         }
-        Ok(())
+        let end_offset =
+            enqueued.fetch_add(data.len() as u64, Ordering::SeqCst) + data.len() as u64;
+        Ok(delivery_future(channel, enqueued, end_offset))
     }
 }
 
-impl StatusPool<RtcDataChannel> for RoundRobinPool<RtcDataChannel> {
+impl StatusPool<TrackedChannel> for RoundRobinPool<TrackedChannel> {
     fn all_ready(&self) -> Result<bool> {
-        self.all(|c| c.ready_state() == RtcDataChannelState::Open)
+        self.all(|(c, _)| c.ready_state() == RtcDataChannelState::Open)
     }
 }
 
@@ -71,7 +119,7 @@ impl StatusPool<RtcDataChannel> for RoundRobinPool<RtcDataChannel> {
 /// Used for browser environment.
 pub struct WebSysWebrtcConnection {
     webrtc_conn: RtcPeerConnection,
-    webrtc_data_channel: Arc<RoundRobinPool<RtcDataChannel>>,
+    webrtc_data_channel: Arc<RoundRobinPool<TrackedChannel>>,
     webrtc_data_channel_state_notifier: Notifier,
 }
 
@@ -85,7 +133,7 @@ pub struct WebSysWebrtcTransport {
 impl WebSysWebrtcConnection {
     fn new(
         webrtc_conn: RtcPeerConnection,
-        webrtc_data_channel: Arc<RoundRobinPool<RtcDataChannel>>,
+        webrtc_data_channel: Arc<RoundRobinPool<TrackedChannel>>,
         webrtc_data_channel_state_notifier: Notifier,
     ) -> Self {
         Self {
@@ -146,10 +194,9 @@ impl ConnectionInterface for WebSysWebrtcConnection {
     type Sdp = String;
     type Error = Error;
 
-    async fn send_message(&self, msg: TransportMessage) -> Result<()> {
+    async fn send_message(&self, msg: TransportMessage) -> Result<DeliveryFuture> {
         self.webrtc_wait_for_data_channel_open().await?;
-        self.webrtc_data_channel.send(msg).await?;
-        Ok(())
+        self.webrtc_data_channel.send(msg).await
     }
 
     fn webrtc_connection_state(&self) -> WebrtcConnectionState {
@@ -222,11 +269,13 @@ impl ConnectionInterface for WebSysWebrtcConnection {
     }
 
     async fn webrtc_wait_for_data_channel_open(&self) -> Result<()> {
+        // `Disconnected` is intentionally not treated as unavailable: it is a
+        // transient ICE state in which the data channel stays open, so we let
+        // the send proceed (the bytes buffer and flush on recovery). The
+        // returned `DeliveryFuture` reports whether they actually made it out.
         if matches!(
             self.webrtc_connection_state(),
-            WebrtcConnectionState::Failed
-                | WebrtcConnectionState::Closed
-                | WebrtcConnectionState::Disconnected
+            WebrtcConnectionState::Failed | WebrtcConnectionState::Closed
         ) {
             return Err(Error::DataChannelOpen("Connection unavailable".to_string()));
         }
@@ -297,31 +346,15 @@ impl TransportInterface for WebSysWebrtcTransport {
 
         let data_channel_inner_cb = inner_cb.clone();
         let channel_pool = Arc::new(RoundRobinPool::default());
-        let channel_pool_ref = channel_pool.clone();
 
         let on_data_channel = Box::new(move |ev: RtcDataChannelEvent| {
             let d = ev.channel();
             let d_label = d.label();
             tracing::debug!("New DataChannel {d_label}");
-            let channel_pool = channel_pool_ref.clone();
-            let on_open_inner_cb = data_channel_inner_cb.clone();
-            let on_open = Box::new(move || {
-                let channel_pool = channel_pool.clone();
-                let inner_cb = on_open_inner_cb.clone();
-                spawn_local(async move {
-                    // check all channels are ready
-                    // trigger on_data_channel_open callback iff all channels ready (open)
-                    if let Ok(true) = channel_pool.all_ready() {
-                        inner_cb.on_data_channel_open().await;
-                    }
-                })
-            });
-
-            let on_close_inner_cb = data_channel_inner_cb.clone();
-            let on_close = Box::new(move || {
-                on_close_inner_cb.on_data_channel_close();
-            });
-
+            // Open/close are detected on the channels we create (the pool, wired
+            // below); a received channel only carries inbound messages. Wiring
+            // open/close here too would fire on_data_channel_open twice (created
+            // + received) and churn join_dht.
             let on_message_inner_cb = data_channel_inner_cb.clone();
             let on_message = Box::new(move |ev: MessageEvent| {
                 let data = ev.data();
@@ -360,14 +393,6 @@ impl TransportInterface for WebSysWebrtcTransport {
                 })
             });
 
-            let c = Closure::wrap(on_open as Box<dyn FnMut()>);
-            d.set_onopen(Some(c.as_ref().unchecked_ref()));
-            c.forget();
-
-            let c = Closure::wrap(on_close as Box<dyn FnMut()>);
-            d.set_onclose(Some(c.as_ref().unchecked_ref()));
-            c.forget();
-
             let c = Closure::wrap(on_message as Box<dyn FnMut(MessageEvent)>);
             d.set_onmessage(Some(c.as_ref().unchecked_ref()));
             c.forget();
@@ -397,9 +422,47 @@ impl TransportInterface for WebSysWebrtcTransport {
         //
         // Create data channel
         //
+        // Wire open/close on the channels this side creates (the pool), not only
+        // on received channels: a received channel's `onopen` can be missed if
+        // it opens before the handler is registered, so `on_data_channel_open`
+        // (and thus `join_dht`) would never fire. Created channels are wired
+        // before they can open, so this is reliable.
         for i in 0..DATA_CHANNEL_POOL_SIZE {
             let ch = webrtc_conn.create_data_channel(&format!("rings_data_channel_{}", i));
-            channel_pool.push(ch)?;
+
+            let on_open_pool = channel_pool.clone();
+            let on_open_cb = inner_cb.clone();
+            let on_open = Box::new(move || {
+                let pool = on_open_pool.clone();
+                let cb = on_open_cb.clone();
+                spawn_local(async move {
+                    if let Ok(true) = pool.all_ready() {
+                        cb.on_data_channel_open().await;
+                    }
+                });
+            });
+            let c = Closure::wrap(on_open as Box<dyn FnMut()>);
+            ch.set_onopen(Some(c.as_ref().unchecked_ref()));
+            c.forget();
+
+            let on_close_pool = channel_pool.clone();
+            let on_close_cb = inner_cb.clone();
+            let on_close = Box::new(move || {
+                let pool = on_close_pool.clone();
+                let cb = on_close_cb.clone();
+                spawn_local(async move {
+                    if let Ok(true) =
+                        pool.all(|(c, _)| c.ready_state() == RtcDataChannelState::Closed)
+                    {
+                        cb.on_data_channel_close().await;
+                    }
+                });
+            });
+            let c = Closure::wrap(on_close as Box<dyn FnMut()>);
+            ch.set_onclose(Some(c.as_ref().unchecked_ref()));
+            c.forget();
+
+            channel_pool.push((ch, Arc::new(AtomicU64::new(0))))?;
         }
 
         //

@@ -21,6 +21,14 @@ use crate::swarm::callback::SwarmCallback;
 use crate::swarm::Swarm;
 use crate::swarm::SwarmBuilder;
 
+mod dht_convergence;
+// Uses the `stateright` model checker, which doesn't build for wasm32.
+#[cfg(not(target_family = "wasm"))]
+mod dht_stateright;
+mod dht_trace_replay;
+// Drives the dummy transport's controlled delivery queue (dummy-only).
+#[cfg(feature = "dummy")]
+mod dht_schedule;
 mod test_connection;
 mod test_message_handler;
 mod test_stabilization;
