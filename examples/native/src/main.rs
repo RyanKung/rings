@@ -1,14 +1,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
+use bytes::Bytes;
 use rings_core::dht::Did;
 use rings_core::ecc::SecretKey;
-use rings_core::message::MessagePayload;
 use rings_core::session::SessionSkBuilder;
 use rings_core::storage::MemStorage;
-use rings_node::backend::types::BackendMessage;
-use rings_node::backend::types::MessageHandler;
+use rings_node::extension::ext::Ctx;
+use rings_node::extension::ext::Interpret;
+use rings_node::extension::ext::Protocol;
+use rings_node::extension::ext::Reject;
+use rings_node::extension::ext::Scope;
+use rings_node::extension::ext::Transition;
+use rings_node::extension::ext::Wire;
 use rings_node::logging::init_logging;
 use rings_node::logging::LogLevel;
 use rings_node::processor::ProcessorBuilder;
@@ -17,18 +21,70 @@ use rings_node::provider::Provider;
 use rings_rpc::method::Method;
 use rings_rpc::protos::rings_node::*;
 
-struct BackendBehaviour;
+/// Namespace this example speaks over.
+const EXAMPLE_NAMESPACE: &str = "example";
 
-#[async_trait]
-impl MessageHandler<BackendMessage> for BackendBehaviour {
-    async fn handle_message(
+/// A decoded example message (who sent it + the text).
+struct Received {
+    summary: String,
+}
+
+/// The example's own effect: surface a received message. Printing is the *shell*'s job —
+/// `step` stays pure (it only describes the effect).
+enum ExampleEffect {
+    Log(String),
+}
+
+/// A minimal pure protocol for this demo: on each message it emits a `Log` effect and
+/// replies with nothing. Unlike the built-in `Echo` it does not echo, so two peers both
+/// running this example do not bounce a message back and forth forever.
+struct Example;
+
+impl Protocol for Example {
+    type State = ();
+    type Event = Received;
+    type Effect = ExampleEffect;
+
+    fn namespace(&self) -> &str {
+        EXAMPLE_NAMESPACE
+    }
+
+    fn init(&self) {}
+
+    fn decode(&self, wire: Wire<'_>) -> Result<Received, Reject> {
+        // `wire.payload` is the raw bytes (the RPC boundary already base64-decoded it).
+        Ok(Received {
+            summary: format!(
+                "from {}: {:?}",
+                wire.from,
+                String::from_utf8_lossy(wire.payload)
+            ),
+        })
+    }
+
+    fn step(&self, _ctx: Ctx<'_, ()>, event: Received) -> Transition<(), ExampleEffect> {
+        Transition::with((), vec![ExampleEffect::Log(event.summary)])
+    }
+}
+
+/// The example's interpreter: the only place IO (here, printing) happens.
+struct ExampleShell;
+
+#[async_trait::async_trait]
+impl Interpret for ExampleShell {
+    type Effect = ExampleEffect;
+
+    async fn run(
         &self,
-        _provider: Arc<Provider>,
-        _ctx: &MessagePayload,
-        msg: &BackendMessage,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        println!("Received message: {:?}", msg);
-        Ok(())
+        _scope: &Scope,
+        effect: ExampleEffect,
+    ) -> rings_node::error::Result<Vec<Bytes>> {
+        match effect {
+            ExampleEffect::Log(summary) => {
+                println!("<=== example protocol received {summary}");
+                Ok(Vec::new())
+            }
+        }
     }
 }
 
@@ -67,8 +123,12 @@ async fn main() {
     // Wrap api with provider
     let provider = Arc::new(Provider::from_processor(processor));
 
-    // Setup your callback handler.
-    provider.set_backend_callback(BackendBehaviour).unwrap();
+    // Install the extension backend so inbound namespaced messages are dispatched to
+    // registered protocols, then register this example's protocol so a peer running the
+    // same binary has a handler for the `example` namespace (otherwise it would drop the
+    // message as unknown).
+    provider.set_backend().unwrap();
+    provider.register_protocol(Example, ExampleShell).unwrap();
 
     // Listen messages from peers.
     let listening_provider = provider.clone();
@@ -123,10 +183,12 @@ async fn main() {
         panic!("Failed to connect to remote peer");
     }
 
-    let msg = BackendMessage::PlainText("Hello from native provider example".to_string());
-    let rpc_req = msg
-        .into_send_backend_message_request(destination_did)
-        .unwrap();
+    let rpc_req = SendBackendMessageRequest {
+        destination_did,
+        namespace: EXAMPLE_NAMESPACE.to_string(),
+        // `data` is base64 on the wire (binary-safe); encode the raw message bytes.
+        data: base64::encode(b"Hello from native provider example"),
+    };
     println!("===> request SendBackendMessage api...");
     let resp = provider
         .request(Method::SendBackendMessage, rpc_req)

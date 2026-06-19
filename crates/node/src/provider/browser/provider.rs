@@ -17,7 +17,6 @@ use rings_core::storage::idb::IdbStorage;
 use rings_core::utils::js_utils;
 use rings_core::utils::js_value;
 use rings_derive::wasm_export;
-use rings_rpc::method::Method;
 use rings_rpc::protos::rings_node::*;
 use wasm_bindgen;
 use wasm_bindgen::prelude::*;
@@ -25,11 +24,6 @@ use wasm_bindgen_futures;
 use wasm_bindgen_futures::future_to_promise;
 use wasm_bindgen_futures::JsFuture;
 
-use crate::backend::browser::BackendBehaviour;
-use crate::backend::types::BackendMessage;
-use crate::backend::types::HttpRequest;
-use crate::backend::types::ServiceMessage;
-use crate::backend::Backend;
 use crate::processor::ProcessorConfig;
 use crate::provider::AsyncSigner;
 use crate::provider::Provider;
@@ -86,7 +80,6 @@ impl Provider {
         account: String,
         account_type: String,
         signer: js_sys::Function,
-        backend_behaviour: Option<BackendBehaviour>,
     ) -> js_sys::Promise {
         fn wrapped_signer(signer: js_sys::Function) -> AsyncSigner {
             Box::new(
@@ -136,32 +129,23 @@ impl Provider {
             )
             .await?;
 
-            if let Some(cb) = backend_behaviour {
-                let backend: Backend = Backend::new(Arc::new(provider.clone()), Box::new(cb));
-                provider
-                    .set_swarm_callback_internal(Arc::new(backend))
-                    .expect("Failed on set swarm callback");
-            }
+            provider
+                .set_backend()
+                .expect("Failed on set swarm callback");
 
             Ok(JsValue::from(provider))
         })
     }
 
     /// Create new provider instance with serialized config (yaml/json)
-    pub fn new_provider_with_serialized_config(
-        config: String,
-        backend: Option<BackendBehaviour>,
-    ) -> js_sys::Promise {
+    pub fn new_provider_with_serialized_config(config: String) -> js_sys::Promise {
         let cfg: ProcessorConfig = serde_yaml::from_str(&config).unwrap();
-        Self::new_provider_with_config(cfg, backend)
+        Self::new_provider_with_config(cfg)
     }
 
     /// Create a new provider instance.
-    pub fn new_provider_with_config(
-        config: ProcessorConfig,
-        backend: Option<BackendBehaviour>,
-    ) -> js_sys::Promise {
-        Self::new_provider_with_storage(config, backend, "rings-node".to_string())
+    pub fn new_provider_with_config(config: ProcessorConfig) -> js_sys::Promise {
+        Self::new_provider_with_storage(config, "rings-node".to_string())
     }
 
     /// get self web3 address
@@ -173,7 +157,6 @@ impl Provider {
     ///  create new unsigned Provider
     pub fn new_provider_with_storage(
         config: ProcessorConfig,
-        backend_behaviour: Option<BackendBehaviour>,
         storage_name: String,
     ) -> js_sys::Promise {
         future_to_promise(async move {
@@ -196,14 +179,30 @@ impl Provider {
             )
             .await
             .map_err(JsError::from)?;
-            if let Some(cb) = backend_behaviour {
-                let backend: Backend = Backend::new(Arc::new(provider.clone()), Box::new(cb));
-                provider
-                    .set_swarm_callback_internal(Arc::new(backend))
-                    .expect("Failed on set swarm callback");
-            }
+            provider
+                .set_backend()
+                .expect("Failed on set swarm callback");
             Ok(JsValue::from(provider))
         })
+    }
+
+    /// Register a protocol handler: `provider.on(namespace, initialState, handler)`.
+    ///
+    /// `namespace` is the protocol namespace, `initialState` is the protocol's initial
+    /// state, and `handler` is a pure transition `(ctx, event) -> { state, effects }`.
+    /// The handler is bridged into the same pure model native uses; effects are run by
+    /// the interpreter. The lower layer (JS vs native) is invisible — callers only ever
+    /// see the provider.
+    pub fn on(
+        &self,
+        namespace: String,
+        initial_state: JsValue,
+        handler: js_sys::Function,
+    ) -> Result<(), JsError> {
+        let protocol =
+            crate::extension::protocols::js::JsProtocol::new(namespace, initial_state, handler);
+        self.register_protocol(protocol, crate::extension::protocols::js::JsShell)
+            .map_err(JsError::from)
     }
 
     /// Request local rpc interface
@@ -283,20 +282,26 @@ impl Provider {
         })
     }
 
-    /// send custom message to peer.
-    pub fn send_message(&self, destination: String, msg: String) -> js_sys::Promise {
-        let ins = self.clone();
+    /// Send a namespaced message to a peer: `provider.send_message(did, namespace, payload)`.
+    ///
+    /// The payload reaches the peer's protocol registered under `namespace` (see
+    /// [`Provider::on`]). This is the uniform upper-layer send, identical to native
+    /// [`Provider::send`](crate::provider::Provider::send).
+    pub fn send_message(
+        &self,
+        destination: String,
+        namespace: String,
+        payload: js_sys::Uint8Array,
+    ) -> js_sys::Promise {
+        let p = self.processor.clone();
         future_to_promise(async move {
             let did = get_did(destination.as_str(), AddressType::DEFAULT)?;
-            let req: BackendMessage = BackendMessage::PlainText(msg);
-            let params = req.into_send_backend_message_request(did)?;
-            let ret = ins
-                .request_internal(
-                    Method::SendBackendMessage.to_string(),
-                    serde_json::to_value(params).map_err(JsError::from)?,
-                )
-                .await?;
-            Ok(js_value::serialize(&ret).map_err(JsError::from)?)
+            let envelope = crate::extension::ext::Envelope::new(namespace, payload.to_vec().into());
+            let tx_id = p
+                .send_envelope(did, &envelope)
+                .await
+                .map_err(JsError::from)?;
+            Ok(JsValue::from_str(tx_id.to_string().as_str()))
         })
     }
 
@@ -340,95 +345,6 @@ impl Provider {
             let vnode_info = vnode::VirtualNode::try_from(data).map_err(JsError::from)?;
             p.storage_store(vnode_info).await.map_err(JsError::from)?;
             Ok(JsValue::null())
-        })
-    }
-
-    /// send http request message to remote
-    /// - destination: did
-    /// - service: service name
-    /// - method: http method
-    /// - path: http path like `/ipfs/abc1234` `/ipns/abc`
-    /// - headers: headers of request
-    /// - body: body of request
-    #[allow(clippy::too_many_arguments)]
-    pub fn send_http_request(
-        &self,
-        destination: String,
-        service: String,
-        method: String,
-        path: String,
-        headers: JsValue,
-        body: Option<js_sys::Uint8Array>,
-        rid: Option<String>,
-    ) -> js_sys::Promise {
-        let p = self.processor.clone();
-
-        future_to_promise(async move {
-            let destination = get_did(destination.as_str(), AddressType::DEFAULT)?;
-
-            let method = http::Method::from_str(method.as_str())
-                .map_err(JsError::from)?
-                .to_string();
-
-            let headers: Vec<(String, String)> = if headers.is_null() {
-                Vec::new()
-            } else if headers.is_object() {
-                let mut header_vec: Vec<(String, String)> = Vec::new();
-                let obj = js_sys::Object::from(headers);
-                let entries = js_sys::Object::entries(&obj);
-                for e in entries.iter() {
-                    if js_sys::Array::is_array(&e) {
-                        let arr = js_sys::Array::from(&e);
-                        if arr.length() != 2 {
-                            continue;
-                        }
-                        let k = arr.get(0).as_string().unwrap();
-                        let v = arr.get(1);
-                        if v.is_string() {
-                            let v = v.as_string().unwrap();
-                            header_vec.push((k, v))
-                        }
-                    }
-                }
-                header_vec
-            } else {
-                Vec::new()
-            };
-
-            let body = body.map(|item| item.to_vec());
-
-            let req = HttpRequest {
-                service,
-                method,
-                path,
-                headers,
-                body,
-                rid,
-            };
-
-            let tx_id = p
-                .send_backend_message(destination, ServiceMessage::HttpRequest(req).into())
-                .await
-                .map_err(JsError::from)?;
-
-            Ok(JsValue::from_str(tx_id.to_string().as_str()))
-        })
-    }
-
-    /// send simple text message to remote
-    /// - destination: A did of destination
-    /// - text: text message
-    pub fn send_simple_text_message(&self, destination: String, text: String) -> js_sys::Promise {
-        let p = self.processor.clone();
-
-        future_to_promise(async move {
-            let destination = get_did(destination.as_str(), AddressType::DEFAULT)?;
-            let tx_id = p
-                .send_backend_message(destination, BackendMessage::PlainText(text))
-                .await
-                .map_err(JsError::from)?;
-
-            Ok(JsValue::from_str(tx_id.to_string().as_str()))
         })
     }
 

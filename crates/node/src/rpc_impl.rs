@@ -200,27 +200,17 @@ impl HandleRpc<DisconnectRequest, DisconnectResponse> for Processor {
 
 #[cfg_attr(feature = "browser", async_trait(?Send))]
 #[cfg_attr(not(feature = "browser"), async_trait)]
-impl HandleRpc<SendCustomMessageRequest, SendCustomMessageResponse> for Processor {
-    async fn handle_rpc(&self, req: SendCustomMessageRequest) -> Result<SendCustomMessageResponse> {
-        let destination = s2d(&req.destination_did)?;
-        let data = base64::decode(req.data)
-            .map_err(|_| Error::invalid_params("Base64 decode data failed"))?;
-        self.send_message(destination, &data).await?;
-        Ok(SendCustomMessageResponse {})
-    }
-}
-
-#[cfg_attr(feature = "browser", async_trait(?Send))]
-#[cfg_attr(not(feature = "browser"), async_trait)]
 impl HandleRpc<SendBackendMessageRequest, SendBackendMessageResponse> for Processor {
     async fn handle_rpc(
         &self,
         req: SendBackendMessageRequest,
     ) -> Result<SendBackendMessageResponse> {
         let destination = s2d(&req.destination_did)?;
-        let data = serde_json::from_str(&req.data)
-            .map_err(|_| Error::invalid_params("Serialize data as json failed"))?;
-        self.send_backend_message(destination, data).await?;
+        let payload = base64::decode(req.data.as_str())
+            .map_err(|e| Error::invalid_params(format!("data is not valid base64: {e:?}")))?;
+        let envelope =
+            crate::extension::ext::Envelope::new(req.namespace, bytes::Bytes::from(payload));
+        self.send_envelope(destination, &envelope).await?;
         Ok(SendBackendMessageResponse {})
     }
 }
