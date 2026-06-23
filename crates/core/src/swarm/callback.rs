@@ -6,9 +6,7 @@ use futures::lock::Mutex as FuturesMutex;
 use rings_transport::core::callback::TransportCallback;
 use rings_transport::core::transport::WebrtcConnectionState;
 
-use crate::chunk::ChunkList;
-use crate::chunk::ChunkManager;
-use crate::consts::TRANSPORT_MTU;
+use crate::chunk::MessageReassembler;
 use crate::dht::Did;
 use crate::message::HandleMsg;
 use crate::message::Message;
@@ -66,7 +64,7 @@ pub struct InnerSwarmCallback {
     transport: Arc<SwarmTransport>,
     message_handler: MessageHandler,
     callback: SharedSwarmCallback,
-    chunk_list: FuturesMutex<ChunkList<TRANSPORT_MTU>>,
+    reassembler: FuturesMutex<MessageReassembler>,
 }
 
 impl InnerSwarmCallback {
@@ -77,7 +75,7 @@ impl InnerSwarmCallback {
             transport,
             message_handler,
             callback,
-            chunk_list: Default::default(),
+            reassembler: Default::default(),
         }
     }
 
@@ -88,7 +86,7 @@ impl InnerSwarmCallback {
     ) -> Result<(), CallbackError> {
         let message: Message = payload.transaction.data()?;
 
-        match &message {
+        let result = match &message {
             Message::ConnectNodeSend(ref msg) => self.message_handler.handle(payload, msg).await,
             Message::ConnectNodeReport(ref msg) => self.message_handler.handle(payload, msg).await,
             Message::FindSuccessorSend(ref msg) => self.message_handler.handle(payload, msg).await,
@@ -115,15 +113,23 @@ impl InnerSwarmCallback {
                 self.message_handler.handle(payload, msg).await
             }
             Message::Chunk(ref msg) => {
-                if let Some(data) = self.chunk_list.lock().await.handle(msg.clone()) {
+                // A chunk is an internal framing envelope, never an application message. When it
+                // completes a payload, re-enter with the reassembled bytes; when it does not, there
+                // is nothing to deliver. Either way we return here so the raw chunk envelope is
+                // *never* passed to `on_inbound` (the app only ever sees reassembled messages).
+                if let Some(data) = self.reassembler.lock().await.handle(msg.clone()) {
                     return self.on_message(cid, &data).await;
                 }
-                Ok(())
+                return Ok(());
             }
+        };
+
+        // A handler that errored must not then be reported to the application as a successful
+        // inbound message: surface the error and do not run `on_inbound` for it.
+        if let Err(e) = result {
+            tracing::error!("Failed to handle_payload: {e:?}");
+            return Err(e.into());
         }
-        .unwrap_or_else(|e| {
-            tracing::error!("Failed to handle_payload: {:?}", e);
-        });
 
         if payload.transaction.destination == self.transport.dht.did {
             self.callback.on_inbound(payload).await?;
@@ -202,7 +208,7 @@ impl TransportCallback for InnerSwarmCallback {
         // waiting for data channel opening in send_message.
         self.callback
             .on_event(&SwarmEvent::ConnectionStateChange {
-                peer: self.transport.dht.did,
+                peer: did,
                 state: WebrtcConnectionState::Connected,
             })
             .await

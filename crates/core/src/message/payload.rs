@@ -381,6 +381,76 @@ pub mod test {
         assert!(payload.verify());
     }
 
+    /// The sender cuts chunk data at `max_message_size - (MAX_CHUNK_ENVELOPE_OVERHEAD +
+    /// TRANSPORT_CUSTOM_OVERHEAD)`. This pins that those reserves are large enough by measuring the
+    /// *exact* bytes the data channel carries: a full-size chunk, re-wrapped in its `MessagePayload`
+    /// **and** the outer `TransportMessage::Custom` frame (what `send_data` actually serializes),
+    /// stays at or below `MAX_DATA_CHANNEL_MESSAGE_SIZE`. If either envelope grows past its reserve,
+    /// this fails instead of silently producing oversized frames the channel would reject.
+    #[test]
+    fn chunk_envelope_fits_reserve() {
+        use rings_transport::core::transport::TransportMessage;
+        use rings_transport::core::transport::MAX_DATA_CHANNEL_MESSAGE_SIZE;
+
+        use crate::chunk::ChunkList;
+        use crate::consts::MAX_CHUNK_ENVELOPE_OVERHEAD;
+        use crate::consts::TRANSPORT_CUSTOM_OVERHEAD;
+
+        let next_hop = SecretKey::random().address().into();
+        let chunk_size = MAX_DATA_CHANNEL_MESSAGE_SIZE
+            - (MAX_CHUNK_ENVELOPE_OVERHEAD + TRANSPORT_CUSTOM_OVERHEAD);
+        let data: Bytes = vec![0xab; chunk_size].into();
+        let chunk = ChunkList::split(&data, chunk_size)
+            .to_vec()
+            .pop()
+            .expect("one chunk");
+
+        // The bytes actually handed to SCTP: bincode(Custom(bincode(MessagePayload))).
+        let payload_bytes = new_payload(Message::Chunk(chunk), next_hop)
+            .to_bincode()
+            .unwrap();
+        let wire = bincode::serialize(&TransportMessage::Custom(payload_bytes.to_vec())).unwrap();
+
+        assert!(
+            wire.len() <= MAX_DATA_CHANNEL_MESSAGE_SIZE,
+            "wrapped chunk frame is {} bytes, exceeds limit {}; raise the reserves",
+            wire.len(),
+            MAX_DATA_CHANNEL_MESSAGE_SIZE,
+        );
+    }
+
+    /// The other framing boundary: a payload [`WireReserves::plan`] keeps `Whole`, once wrapped in
+    /// the outer `TransportMessage::Custom` frame, stays within the limit — pinning that
+    /// `WireReserves::PRODUCTION.whole` is enough for the whole-message path (not just the chunk
+    /// path), and that one byte past the boundary switches to chunked.
+    #[test]
+    fn whole_message_boundary_fits_custom_wrapper() {
+        use rings_transport::core::transport::TransportMessage;
+        use rings_transport::core::transport::MAX_DATA_CHANNEL_MESSAGE_SIZE;
+
+        use crate::chunk::Framing;
+        use crate::chunk::WireReserves;
+
+        let reserves = WireReserves::PRODUCTION;
+        let limit = MAX_DATA_CHANNEL_MESSAGE_SIZE;
+        // Largest payload that should still be sent whole.
+        let payload_len = limit - reserves.whole;
+        assert_eq!(reserves.plan(payload_len, limit), Some(Framing::Whole));
+
+        let wire = bincode::serialize(&TransportMessage::Custom(vec![0u8; payload_len])).unwrap();
+        assert!(
+            wire.len() <= limit,
+            "whole wire {} exceeds limit {}",
+            wire.len(),
+            limit
+        );
+        // One byte past the boundary must switch to chunked.
+        assert!(matches!(
+            reserves.plan(payload_len + 1, limit),
+            Some(Framing::Chunked { .. })
+        ));
+    }
+
     #[test]
     fn test_message_payload_from_auto() {
         let next_hop = SecretKey::random().address().into();

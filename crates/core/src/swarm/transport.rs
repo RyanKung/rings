@@ -22,9 +22,11 @@ use rings_transport::core::transport::TransportMessage;
 use rings_transport::core::transport::WebrtcConnectionState;
 use rings_transport::delivery::DeliveryFuture;
 
+use crate::chunk::Chunk;
 use crate::chunk::ChunkList;
+use crate::chunk::Framing;
+use crate::chunk::WireReserves;
 use crate::consts::TRANSPORT_MAX_SIZE;
-use crate::consts::TRANSPORT_MTU;
 use crate::dht::Did;
 use crate::dht::LiveDid;
 use crate::dht::PeerRing;
@@ -76,6 +78,98 @@ fn spawn_delivery(fut: DeliveryFuture, did: Did) {
             tracing::warn!("Message to {did} was not delivered: {e}");
         }
     });
+}
+
+/// Frame one chunk into the bytes a data-channel send carries: wrap it in a `MessagePayload`
+/// addressed to `did` and serialize it. Pure (the only failure is serialization).
+fn frame_chunk(session_sk: &SessionSk, did: Did, chunk: Chunk) -> Result<Bytes> {
+    MessagePayload::new_send(Message::Chunk(chunk), session_sk, did, did)?.to_bincode()
+}
+
+/// The *tail* of a chunked message — every chunk after the first — yielded lazily. Boxed so the
+/// background task owns a concrete, nameable type (`Send` off the browser, where spawned tasks must
+/// be `Send`; single-threaded on it).
+#[cfg(not(feature = "wasm"))]
+type ChunkTail = Box<dyn Iterator<Item = Chunk> + Send>;
+#[cfg(feature = "wasm")]
+type ChunkTail = Box<dyn Iterator<Item = Chunk>>;
+
+/// Drive the *tail* of a chunked send: the first chunk has already been accepted by the caller
+/// (`do_send_payload`), so wait for it to flush (backpressure), then frame, send, and await each
+/// remaining chunk in turn. One chunk is in flight at a time and no per-chunk task is spawned. A
+/// later frame/send failure aborts the rest; the receiver TTL-expires the partial message (chunks
+/// carry the message ttl), so no abort marker is needed. Fire-and-forget — the caller already
+/// learned whether the *first* chunk was accepted, matching the whole-message contract.
+async fn run_chunked_send(
+    conn: SwarmConnection,
+    tail: ChunkTail,
+    first_delivery: DeliveryFuture,
+    session_sk: SessionSk,
+    did: Did,
+) {
+    if let Err(e) = first_delivery.await {
+        tracing::warn!("Chunked send to {did} stopped before the first chunk flushed: {e}");
+        return;
+    }
+    for chunk in tail {
+        let bytes = match frame_chunk(&session_sk, did, chunk) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!("Chunked send to {did} aborted while framing a chunk: {e}");
+                return;
+            }
+        };
+        match conn.send_data(bytes).await {
+            Ok(delivery) => {
+                if let Err(e) = delivery.await {
+                    tracing::warn!("Chunked send to {did} stopped before flush: {e}");
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Chunked send to {did} stopped: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Drive the tail of a chunked send on the runtime (one bounded task per large message). See
+/// [`run_chunked_send`].
+#[cfg(feature = "wasm")]
+fn spawn_chunked_send(
+    conn: SwarmConnection,
+    tail: ChunkTail,
+    first_delivery: DeliveryFuture,
+    session_sk: SessionSk,
+    did: Did,
+) {
+    wasm_bindgen_futures::spawn_local(run_chunked_send(
+        conn,
+        tail,
+        first_delivery,
+        session_sk,
+        did,
+    ));
+}
+
+/// Drive the tail of a chunked send on the runtime (one bounded task per large message). See
+/// [`run_chunked_send`].
+#[cfg(not(feature = "wasm"))]
+fn spawn_chunked_send(
+    conn: SwarmConnection,
+    tail: ChunkTail,
+    first_delivery: DeliveryFuture,
+    session_sk: SessionSk,
+    did: Did,
+) {
+    tokio::spawn(run_chunked_send(
+        conn,
+        tail,
+        first_delivery,
+        session_sk,
+        did,
+    ));
 }
 
 impl SwarmTransport {
@@ -297,6 +391,12 @@ impl SwarmConnection {
     pub fn webrtc_connection_state(&self) -> WebrtcConnectionState {
         self.connection.webrtc_connection_state()
     }
+
+    /// The largest single data-channel message this connection can carry — the negotiated
+    /// `max_message_size`. Used to size payload chunks so each wrapped chunk stays within the limit.
+    pub fn max_message_size(&self) -> usize {
+        self.connection.max_message_size()
+    }
 }
 
 #[cfg_attr(feature = "wasm", async_trait(?Send))]
@@ -335,21 +435,39 @@ impl PayloadSender for SwarmTransport {
             return Err(Error::MessageTooLarge(data.len()));
         }
 
-        // Each send returns a `DeliveryFuture` resolving to whether the bytes
-        // were actually flushed to the wire. We toss it to the runtime rather
-        // than awaiting it, so the send itself stays fire-and-forget; a message
-        // lost before flush (e.g. the connection died while buffered) is logged
-        // here instead of propagating a delivery status up through every layer.
-        if data.len() > TRANSPORT_MTU {
-            let chunks = ChunkList::<TRANSPORT_MTU>::from(&data);
-            for chunk in chunks {
-                let data =
-                    MessagePayload::new_send(Message::Chunk(chunk), &self.session_sk, did, did)?
-                        .to_bincode()?;
-                spawn_delivery(conn.send_data(data).await?, did);
+        // The chunk-vs-whole decision is the pure `WireReserves::plan`, against this connection's
+        // negotiated `max_message_size`; this block is only the effectful shell carrying it out.
+        // `None` means the peer's limit is too small to carry even one useful chunk — a real failure
+        // we surface (before sending anything) rather than fragmenting into a flood of near-empty
+        // chunks. Both arms are **fire-and-forget**: `send_message` returns once the bytes are
+        // accepted into the send buffer, not once they flush — a whole message hands its
+        // `DeliveryFuture` to the runtime, and a chunked message is driven by one bounded background
+        // task (one chunk in flight; see `run_chunked_send`), so a large payload never blocks the
+        // caller's path while keeping memory and the runtime task count bounded.
+        let plan = WireReserves::PRODUCTION
+            .plan(data.len(), conn.max_message_size())
+            .ok_or(Error::PeerMaxMessageSizeTooSmall(conn.max_message_size()))?;
+        match plan {
+            Framing::Whole => spawn_delivery(conn.send_data(data).await?, did),
+            Framing::Chunked { chunk_size } => {
+                // Frame and accept the FIRST chunk on the caller's path, so an immediate send
+                // failure (the buffer rejecting the bytes) surfaces here exactly as it does for a
+                // whole message — `await send_message` callers learn the send was admitted. The
+                // first chunk's flush and every remaining chunk are then driven by one bounded
+                // background task (`run_chunked_send`), preserving fire-and-forget for the rest.
+                let mut chunks = ChunkList::stream(data, chunk_size);
+                if let Some(first) = chunks.next() {
+                    let first = frame_chunk(&self.session_sk, did, first)?;
+                    let first_delivery = conn.send_data(first).await?;
+                    spawn_chunked_send(
+                        conn,
+                        Box::new(chunks),
+                        first_delivery,
+                        self.session_sk.clone(),
+                        did,
+                    );
+                }
             }
-        } else {
-            spawn_delivery(conn.send_data(data).await?, did);
         }
 
         tracing::debug!(

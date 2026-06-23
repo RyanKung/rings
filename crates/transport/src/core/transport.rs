@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::connection_ref::ConnectionRef;
 use crate::core::callback::BoxedTransportCallback;
+use crate::core::sdp::parse_sdp_max_message_size;
 use crate::delivery::DeliveryFuture;
 
 /// Wrapper for the data that is sent over the data channel.
@@ -59,6 +60,27 @@ pub enum WebrtcConnectionState {
     Closed,
 }
 
+/// Interop ceiling for a single data-channel message, in bytes — RFC 8841's default
+/// `max-message-size` (65536), the value a spec-compliant peer accepts when it advertises nothing
+/// else. We treat it as a hard send ceiling: a sender never exceeds it regardless of what the
+/// remote advertises, and a per-channel
+/// [`max_message_size`](ConnectionInterface::max_message_size) may resolve to *less* (a constrained
+/// peer) but never more. NOTE: this is the protocol default, not an independently verified property
+/// of every backend's SCTP stack — a peer advertising a *larger* limit is still clamped to this.
+pub const MAX_DATA_CHANNEL_MESSAGE_SIZE: usize = 65536;
+
+/// The effective per-message send limit for a peer whose SDP is `remote_sdp`. The negotiated value
+/// is parsed from the SDP by [`crate::core::sdp`]; this function is the *policy* layered on top.
+/// Per RFC 8841 an absent attribute defaults to 65536 and a value of `0` means "no limit" (we still
+/// bound it by our own send cap); any explicit value is honoured but capped at
+/// [`MAX_DATA_CHANNEL_MESSAGE_SIZE`] for interop. Always returns a positive value.
+pub fn effective_max_message_size(remote_sdp: &str) -> usize {
+    match parse_sdp_max_message_size(remote_sdp) {
+        None | Some(0) => MAX_DATA_CHANNEL_MESSAGE_SIZE,
+        Some(n) => (n as usize).min(MAX_DATA_CHANNEL_MESSAGE_SIZE),
+    }
+}
+
 /// The [ConnectionInterface] trait defines how to
 /// make webrtc ice handshake with a remote peer and then send data channel message to it.
 #[cfg_attr(feature = "web-sys-webrtc", async_trait(?Send))]
@@ -81,6 +103,13 @@ pub trait ConnectionInterface {
 
     /// Get current webrtc connection state.
     fn webrtc_connection_state(&self) -> WebrtcConnectionState;
+
+    /// The maximum size, in bytes, of one message this connection can send — the channel's
+    /// negotiated SCTP / data-channel `max_message_size`, capped at
+    /// [`MAX_DATA_CHANNEL_MESSAGE_SIZE`] for cross-peer interop. A caller must keep every sent
+    /// message at or below this; larger payloads have to be chunked. Reported per-channel so a
+    /// constrained channel (which can negotiate a smaller limit) is respected.
+    fn max_message_size(&self) -> usize;
 
     /// This is a debug method to dump the stats of webrtc connection.
     async fn get_stats(&self) -> Vec<String>;
@@ -148,3 +177,58 @@ pub type BoxedTransport<C, E> =
 /// Used to store a boxed [TransportInterface] trait object.
 #[cfg(feature = "web-sys-webrtc")]
 pub type BoxedTransport<C, E> = Box<dyn TransportInterface<Connection = C, Error = E>>;
+
+#[cfg(test)]
+mod tests {
+    // SDP parsing (including section semantics) is tested in `crate::core::sdp`; these cover the
+    // policy `effective_*` layers on top of it (default / no-limit / cap).
+    use super::effective_max_message_size;
+    use super::MAX_DATA_CHANNEL_MESSAGE_SIZE;
+
+    /// A data-channel SDP advertising `max-message-size:<value>` in the right media section.
+    fn sdp_with(value: &str) -> String {
+        format!(
+            "v=0\r\n\
+             m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+             a=max-message-size:{value}\r\n"
+        )
+    }
+
+    #[test]
+    fn effective_absent_defaults_to_cap() {
+        let sdp = "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
+        assert_eq!(
+            effective_max_message_size(sdp),
+            MAX_DATA_CHANNEL_MESSAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn effective_zero_means_no_limit_uses_cap() {
+        assert_eq!(
+            effective_max_message_size(&sdp_with("0")),
+            MAX_DATA_CHANNEL_MESSAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn effective_smaller_value_is_honoured() {
+        assert_eq!(effective_max_message_size(&sdp_with("16384")), 16384);
+    }
+
+    #[test]
+    fn effective_larger_value_is_capped() {
+        assert_eq!(
+            effective_max_message_size(&sdp_with("1048576")),
+            MAX_DATA_CHANNEL_MESSAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn effective_exactly_cap_is_cap() {
+        assert_eq!(
+            effective_max_message_size(&sdp_with("65536")),
+            MAX_DATA_CHANNEL_MESSAGE_SIZE
+        );
+    }
+}

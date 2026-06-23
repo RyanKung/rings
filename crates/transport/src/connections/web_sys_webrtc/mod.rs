@@ -1,4 +1,6 @@
+use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -30,10 +32,12 @@ use crate::core::pool::MessageSenderPool;
 use crate::core::pool::RoundRobin;
 use crate::core::pool::RoundRobinPool;
 use crate::core::pool::StatusPool;
+use crate::core::transport::effective_max_message_size;
 use crate::core::transport::ConnectionInterface;
 use crate::core::transport::TransportInterface;
 use crate::core::transport::TransportMessage;
 use crate::core::transport::WebrtcConnectionState;
+use crate::core::transport::MAX_DATA_CHANNEL_MESSAGE_SIZE;
 use crate::delivery::DeliveryFuture;
 use crate::error::Error;
 use crate::error::Result;
@@ -101,7 +105,7 @@ impl MessageSenderPool<TrackedChannel> for RoundRobinPool<TrackedChannel> {
             .map_err(Error::WebSysWebrtc)
         {
             tracing::error!("{:?}, Data size: {:?}", e, data.len());
-            return Err(e.into());
+            return Err(e);
         }
         let end_offset =
             enqueued.fetch_add(data.len() as u64, Ordering::SeqCst) + data.len() as u64;
@@ -119,8 +123,13 @@ impl StatusPool<TrackedChannel> for RoundRobinPool<TrackedChannel> {
 /// Used for browser environment.
 pub struct WebSysWebrtcConnection {
     webrtc_conn: RtcPeerConnection,
-    webrtc_data_channel: Arc<RoundRobinPool<TrackedChannel>>,
+    // `Rc`, not `Arc`: the browser backend is single-threaded (the `ConnectionInterface` impl is
+    // `?Send`), so the channel pool is never shared across threads.
+    webrtc_data_channel: Rc<RoundRobinPool<TrackedChannel>>,
     webrtc_data_channel_state_notifier: Notifier,
+    /// Negotiated SCTP `max_message_size` (RFC 8841), parsed from the remote SDP at handshake.
+    /// `0` means not yet negotiated. Parsed identically to native for consistent behaviour.
+    remote_max_message_size: Arc<AtomicUsize>,
 }
 
 /// [WebSysWebrtcTransport] manages all the [WebSysWebrtcConnection] and
@@ -133,13 +142,14 @@ pub struct WebSysWebrtcTransport {
 impl WebSysWebrtcConnection {
     fn new(
         webrtc_conn: RtcPeerConnection,
-        webrtc_data_channel: Arc<RoundRobinPool<TrackedChannel>>,
+        webrtc_data_channel: Rc<RoundRobinPool<TrackedChannel>>,
         webrtc_data_channel_state_notifier: Notifier,
     ) -> Self {
         Self {
             webrtc_conn,
             webrtc_data_channel,
             webrtc_data_channel_state_notifier,
+            remote_max_message_size: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -203,6 +213,15 @@ impl ConnectionInterface for WebSysWebrtcConnection {
         self.webrtc_conn.connection_state().into()
     }
 
+    fn max_message_size(&self) -> usize {
+        // The value negotiated from the remote SDP at handshake; `0` = not yet negotiated, so
+        // fall back to the interop default. Same parsing as native (consistent behaviour).
+        match self.remote_max_message_size.load(Ordering::SeqCst) {
+            0 => MAX_DATA_CHANNEL_MESSAGE_SIZE,
+            n => n,
+        }
+    }
+
     async fn get_stats(&self) -> Vec<String> {
         let promise = self.webrtc_conn.get_stats();
         let Ok(value) = wasm_bindgen_futures::JsFuture::from(promise).await else {
@@ -235,6 +254,10 @@ impl ConnectionInterface for WebSysWebrtcConnection {
 
     async fn webrtc_answer_offer(&self, offer: Self::Sdp) -> Result<Self::Sdp> {
         tracing::debug!("webrtc_answer_offer, offer: {offer:?}");
+        // Read the negotiated limit, but record it only after the *whole* answer path
+        // (setRemoteDescription + createAnswer + setLocalDescription + gather) has succeeded, so a
+        // failure midway does not leave a partially-updated connection carrying a stale size.
+        let negotiated_max_message_size = effective_max_message_size(&offer);
 
         let set_remote_init = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
         set_remote_init.set_sdp(&offer);
@@ -253,17 +276,24 @@ impl ConnectionInterface for WebSysWebrtcConnection {
         let promise = self.webrtc_conn.set_local_description(&set_local_init);
         JsFuture::from(promise).await.map_err(Error::WebSysWebrtc)?;
 
-        self.webrtc_gather().await
+        let local_sdp = self.webrtc_gather().await?;
+        self.remote_max_message_size
+            .store(negotiated_max_message_size, Ordering::SeqCst);
+        Ok(local_sdp)
     }
 
     async fn webrtc_accept_answer(&self, answer: Self::Sdp) -> Result<()> {
         tracing::debug!("webrtc_accept_answer, answer: {answer:?}");
+        let negotiated_max_message_size = effective_max_message_size(&answer);
 
         let set_remote_init = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
         set_remote_init.set_sdp(&answer);
 
         let promise = self.webrtc_conn.set_remote_description(&set_remote_init);
         JsFuture::from(promise).await.map_err(Error::WebSysWebrtc)?;
+        // Applied: now it is correct to record the negotiated limit.
+        self.remote_max_message_size
+            .store(negotiated_max_message_size, Ordering::SeqCst);
 
         Ok(())
     }
@@ -338,14 +368,14 @@ impl TransportInterface for WebSysWebrtcTransport {
         // Set callbacks
         //
         let webrtc_data_channel_state_notifier = Notifier::default();
-        let inner_cb = Arc::new(InnerTransportCallback::new(
+        let inner_cb = Rc::new(InnerTransportCallback::new(
             cid,
             callback,
             webrtc_data_channel_state_notifier.clone(),
         ));
 
         let data_channel_inner_cb = inner_cb.clone();
-        let channel_pool = Arc::new(RoundRobinPool::default());
+        let channel_pool = Rc::new(RoundRobinPool::default());
 
         let on_data_channel = Box::new(move |ev: RtcDataChannelEvent| {
             let d = ev.channel();
@@ -428,7 +458,7 @@ impl TransportInterface for WebSysWebrtcTransport {
         // (and thus `join_dht`) would never fire. Created channels are wired
         // before they can open, so this is reliable.
         for i in 0..DATA_CHANNEL_POOL_SIZE {
-            let ch = webrtc_conn.create_data_channel(&format!("rings_data_channel_{}", i));
+            let ch = webrtc_conn.create_data_channel(&format!("rings_data_channel_{i}"));
 
             let on_open_pool = channel_pool.clone();
             let on_open_cb = inner_cb.clone();

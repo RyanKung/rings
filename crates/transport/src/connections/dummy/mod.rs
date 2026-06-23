@@ -20,6 +20,7 @@ use crate::core::transport::ConnectionInterface;
 use crate::core::transport::TransportInterface;
 use crate::core::transport::TransportMessage;
 use crate::core::transport::WebrtcConnectionState;
+use crate::core::transport::MAX_DATA_CHANNEL_MESSAGE_SIZE;
 use crate::delivery::DeliveryFuture;
 use crate::error::Error;
 use crate::error::Result;
@@ -50,7 +51,16 @@ thread_local! {
     static CONTROLLED: Cell<bool> = const { Cell::new(false) };
     /// Test-only controlled delivery queue: `(target connection rand_id, event)`,
     /// populated instead of auto-dispatching while `CONTROLLED` is on.
-    static DELIVERY: RefCell<VecDeque<(String, Event)>> = RefCell::new(VecDeque::new());
+    static DELIVERY: RefCell<VecDeque<(String, Event)>> = const { RefCell::new(VecDeque::new()) };
+    /// Test-only per-thread counter of data-channel messages dispatched by `send_message`, so a
+    /// test can prove an expected send happened (or, after an error, did *not* happen). Thread-local
+    /// for the same isolation reason as the controlled queue.
+    static SENT_COUNT: Cell<usize> = const { Cell::new(0) };
+    /// Test-only per-thread override for the negotiated `max_message_size` the dummy backend
+    /// reports. `0` = report the default; a smaller value lets a test force the chunked send path
+    /// through `do_send_payload` and exercise real reassembly. Thread-local for the same isolation
+    /// reason as the controlled queue.
+    static MAX_MESSAGE_SIZE: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Test-only controlled delivery scheduler. When enabled (per thread), dummy
@@ -62,6 +72,7 @@ pub mod controlled {
     use super::CONNS;
     use super::CONTROLLED;
     use super::DELIVERY;
+    use super::MAX_MESSAGE_SIZE;
 
     /// Turn the controlled scheduler on/off for the current thread. Turning it
     /// off clears this thread's queue.
@@ -70,6 +81,23 @@ pub mod controlled {
         if !on {
             DELIVERY.with(|q| q.borrow_mut().clear());
         }
+    }
+
+    /// Test hook: override the `max_message_size` the dummy backend reports on this thread (`0`
+    /// restores the default). Lets a test drive the chunked send path and reassembly end to end.
+    pub fn set_max_message_size(n: usize) {
+        MAX_MESSAGE_SIZE.with(|m| m.set(n));
+    }
+
+    /// Test hook: number of data-channel messages `send_message` has dispatched on this thread.
+    /// Paired with [`reset_sent_count`] to assert that a failed send enqueued nothing.
+    pub fn sent_count() -> usize {
+        super::SENT_COUNT.with(|c| c.get())
+    }
+
+    /// Test hook: reset the [`sent_count`] counter for this thread.
+    pub fn reset_sent_count() {
+        super::SENT_COUNT.with(|c| c.set(0));
     }
 
     /// Number of events currently queued on the current thread.
@@ -166,9 +194,7 @@ impl DummyConnection {
     }
 
     fn remote_conn(&self) -> Option<Arc<DummyConnection>> {
-        let Some(cid) = { self.remote_rand_id.lock().unwrap() }.clone() else {
-            return None;
-        };
+        let cid = { self.remote_rand_id.lock().unwrap() }.clone()?;
         // The remote may already have been closed and removed from the global
         // map (e.g. during a disconnect). Return None instead of panicking, so
         // callers treat it like a closed connection.
@@ -235,6 +261,7 @@ impl ConnectionInterface for DummyConnection {
 
     async fn send_message(&self, msg: TransportMessage) -> Result<DeliveryFuture> {
         self.webrtc_wait_for_data_channel_open().await?;
+        SENT_COUNT.with(|c| c.set(c.get() + 1));
 
         let data = bincode::serialize(&msg).map(Bytes::from)?;
         // The remote connection may have been torn down between the data
@@ -257,6 +284,13 @@ impl ConnectionInterface for DummyConnection {
 
     fn webrtc_connection_state(&self) -> WebrtcConnectionState {
         *self.webrtc_connection_state.lock().unwrap()
+    }
+
+    fn max_message_size(&self) -> usize {
+        match MAX_MESSAGE_SIZE.with(|m| m.get()) {
+            0 => MAX_DATA_CHANNEL_MESSAGE_SIZE,
+            n => n,
+        }
     }
 
     async fn get_stats(&self) -> Vec<String> {

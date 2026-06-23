@@ -96,7 +96,7 @@ impl MessageHandler {
             .await
             .is_none()
         {
-            self.dht.remove(peer)?
+            self.dht.remove(peer)?;
         };
         Ok(())
     }
