@@ -1,11 +1,21 @@
 use std::str::FromStr;
+#[cfg(feature = "dummy")]
+use std::sync::Arc;
 
+#[cfg(feature = "dummy")]
+use rings_transport::connections::dummy_controlled;
 use rings_transport::core::transport::WebrtcConnectionState;
 use tokio::time::sleep;
+#[cfg(feature = "dummy")]
+use tokio::time::timeout;
 use tokio::time::Duration;
 
 use crate::dht::successor::SuccessorReader;
 use crate::dht::vnode::VirtualNode;
+#[cfg(feature = "dummy")]
+use crate::dht::PeerRingAction;
+#[cfg(feature = "dummy")]
+use crate::dht::PeerRingRemoteAction;
 use crate::ecc::tests::gen_ordered_keys;
 use crate::ecc::SecretKey;
 use crate::error::Result;
@@ -14,9 +24,19 @@ use crate::message::Encoder;
 use crate::message::FindSuccessorReportHandler;
 use crate::message::FindSuccessorThen;
 use crate::message::Message;
+#[cfg(feature = "dummy")]
+use crate::message::MessageHandler;
 use crate::prelude::vnode::VNodeOperation;
+#[cfg(feature = "dummy")]
+use crate::swarm::callback::SwarmCallback;
 use crate::tests::default::prepare_node;
 use crate::tests::manually_establish_connection;
+
+#[cfg(feature = "dummy")]
+struct NoopCallback;
+
+#[cfg(feature = "dummy")]
+impl SwarmCallback for NoopCallback {}
 
 #[tokio::test]
 async fn test_handle_join() -> Result<()> {
@@ -31,6 +51,79 @@ async fn test_handle_join() -> Result<()> {
         .successors()
         .list()?
         .contains(&key2.address().into()));
+    Ok(())
+}
+
+#[cfg(feature = "dummy")]
+#[tokio::test]
+async fn test_join_dht_keeps_local_join_when_convergence_send_fails() -> Result<()> {
+    dummy_controlled::enable(true);
+    dummy_controlled::set_max_message_size(0);
+
+    let key1 = SecretKey::random();
+    let key2 = SecretKey::random();
+    let node1 = prepare_node(key1).await;
+    let node2 = prepare_node(key2).await;
+    manually_establish_connection(&node1.swarm, &node2.swarm).await;
+
+    assert!(
+        node1.dht().successors().list()?.is_empty(),
+        "controlled delivery should prevent automatic DataChannelOpen join"
+    );
+
+    dummy_controlled::enable(false);
+    dummy_controlled::set_max_message_size(1);
+
+    let handler = MessageHandler::new(node1.swarm.transport.clone(), Arc::new(NoopCallback));
+    let join_result = handler.join_dht(node2.did()).await;
+
+    dummy_controlled::set_max_message_size(0);
+
+    assert!(
+        join_result.is_ok(),
+        "join must not fail when follow-up convergence sends fail: {join_result:?}"
+    );
+    assert!(node1.dht().successors().list()?.contains(&node2.did()));
+
+    Ok(())
+}
+
+#[cfg(feature = "dummy")]
+#[tokio::test]
+async fn test_handle_dht_notify_remote_action_sends_predecessor_to_target() -> Result<()> {
+    dummy_controlled::enable(true);
+
+    let keys = gen_ordered_keys(3);
+    let node1 = prepare_node(keys[0]).await;
+    let node2 = prepare_node(keys[1]).await;
+    let node3 = prepare_node(keys[2]).await;
+    manually_establish_connection(&node1.swarm, &node2.swarm).await;
+
+    // Clear queued connection-open callbacks so this test exercises only the
+    // explicit handler action below, not automatic join/stabilization traffic.
+    dummy_controlled::enable(false);
+
+    let handler = MessageHandler::new(node1.swarm.transport.clone(), Arc::new(NoopCallback));
+    handler
+        .handle_dht_events(&PeerRingAction::RemoteAction(
+            node2.did(),
+            PeerRingRemoteAction::Notify(node3.did()),
+        ))
+        .await?;
+
+    let payload = timeout(Duration::from_secs(1), node2.listen_once())
+        .await
+        .expect("notify target should receive a message")
+        .expect("notify target message stream should stay open");
+
+    assert_eq!(payload.transaction.destination, node2.did());
+    match payload.transaction.data::<Message>()? {
+        Message::NotifyPredecessorSend(message::NotifyPredecessorSend { did }) => {
+            assert_eq!(did, node3.did());
+        }
+        other => panic!("expected NotifyPredecessorSend, got {other:?}"),
+    }
+
     Ok(())
 }
 
@@ -99,8 +192,11 @@ async fn test_handle_connect_node() -> Result<()> {
         WebrtcConnectionState::Connected,
     );
 
-    // node1.dht() send msg to node2.dht() ask for connecting node3.dht()
-    node1.swarm.connect(node3.did()).await.unwrap();
+    // node1 may already have connected node3 while syncing successor-list
+    // candidates. If not, ask DHT to connect it through node2.
+    if node1.swarm.transport.get_connection(node3.did()).is_none() {
+        node1.swarm.connect(node3.did()).await.unwrap();
+    }
     sleep(Duration::from_millis(10000)).await;
 
     let connection_1_to_3 = node1.swarm.transport.get_connection(node3.did());

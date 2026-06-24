@@ -7,7 +7,6 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 
 use super::MessagePayload;
-use crate::dht::Chord;
 use crate::dht::CorrectChord;
 use crate::dht::Did;
 use crate::dht::PeerRing;
@@ -68,25 +67,37 @@ impl MessageHandler {
         InnerSwarmCallback::new(self.transport.clone(), self.swarm_callback.clone())
     }
 
-    pub(crate) async fn join_dht(&self, peer: Did) -> Result<()> {
-        if cfg!(feature = "experimental") {
-            let conn = self
-                .transport
-                .get_connection(peer)
-                .ok_or(Error::SwarmMissDidInTable(peer))?;
-            let dht_ev = self.dht.join_then_sync(conn).await?;
-            self.handle_dht_events(&dht_ev).await
-        } else {
-            let dht_ev = self.dht.join(peer)?;
-            // `dht.join` already updated the local routing table synchronously;
-            // `handle_dht_events` only fires best-effort convergence messages.
-            // A send here can legitimately fail if the peer churned away, so log
-            // and continue instead of panicking.
-            if let Err(e) = self.handle_dht_events(&dht_ev).await {
-                tracing::warn!("Failed to handle dht events while joining {peer}: {e:?}");
-            }
-            Ok(())
+    /// Idempotently establish a DHT-driven transport connection.
+    ///
+    /// Self and already-connected peers are no-ops. `AlreadyConnected` is treated
+    /// as success so concurrent DHT actions racing through `MultiActions` do not
+    /// fail the whole handler.
+    pub(crate) async fn connect_dht_peer(&self, peer: Did) -> Result<()> {
+        if peer == self.dht.did || self.transport.get_connection(peer).is_some() {
+            return Ok(());
         }
+
+        match self.transport.connect(peer, self.inner_callback()).await {
+            Ok(()) | Err(Error::AlreadyConnected) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub(crate) async fn join_dht(&self, peer: Did) -> Result<()> {
+        // Default HMCC/Zave join path: maps to the JoinThenSync operation in
+        // the CorrectChord spec (see tests/default/dht_convergence.rs).
+        let conn = self
+            .transport
+            .get_connection(peer)
+            .ok_or(Error::SwarmMissDidInTable(peer))?;
+        let dht_ev = self.dht.join_then_sync(conn).await?;
+        // The local join has completed. Follow-up convergence messages are
+        // best-effort: a peer can churn before these sends complete, and that
+        // must not suppress the application-level Connected event.
+        if let Err(e) = self.handle_dht_events(&dht_ev).await {
+            tracing::warn!("Failed to handle dht events while joining {peer}: {e:?}");
+        }
+        Ok(())
     }
 
     pub(crate) async fn leave_dht(&self, peer: Did) -> Result<()> {
@@ -134,6 +145,10 @@ impl MessageHandler {
             }
             // A new successor is set, request the new successor for it's successor list
             PeerRingAction::RemoteAction(next, PeerRingRemoteAction::QueryForSuccessorList) => {
+                if !self.transport.is_connected(*next) {
+                    self.connect_dht_peer(*next).await?;
+                    return Ok(());
+                }
                 self.transport
                     .send_direct_message(
                         Message::QueryForTopoInfoSend(QueryForTopoInfoSend::new_for_sync(*next)),
@@ -143,17 +158,23 @@ impl MessageHandler {
                 Ok(())
             }
             PeerRingAction::RemoteAction(did, PeerRingRemoteAction::TryConnect) => {
-                self.transport.connect(*did, self.inner_callback()).await?;
+                self.connect_dht_peer(*did).await?;
                 Ok(())
             }
-            PeerRingAction::RemoteAction(did, PeerRingRemoteAction::Notify(target_id)) => {
-                if did == target_id {
-                    tracing::warn!("Did is equal to target_id, may implement wrong.");
+            PeerRingAction::RemoteAction(did, PeerRingRemoteAction::Notify(predecessor)) => {
+                if did == predecessor {
+                    tracing::warn!("Notify target is equal to predecessor, may implement wrong.");
                     return Ok(());
                 }
+                if !self.transport.is_connected(*did) {
+                    self.connect_dht_peer(*did).await?;
+                    return Ok(());
+                }
+                // `RemoteAction(target, Notify(pred))` means "send pred to target"
+                // and maps to CorrectStabilize.notify' in the TLA+ spec mirror.
                 let msg =
-                    Message::NotifyPredecessorSend(NotifyPredecessorSend { did: self.dht.did });
-                self.transport.send_message(msg, *target_id).await?;
+                    Message::NotifyPredecessorSend(NotifyPredecessorSend { did: *predecessor });
+                self.transport.send_message(msg, *did).await?;
                 Ok(())
             }
             PeerRingAction::MultiActions(acts) => {

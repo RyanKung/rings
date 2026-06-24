@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::did::BiasId;
+use super::finger::DEFAULT_FINGER_TABLE_SIZE;
 use super::successor::SuccessorSeq;
 use super::types::Chord;
 use super::types::ChordStorage;
@@ -94,7 +95,10 @@ pub enum RemoteAction {
     FindVNode(Did),
     /// Need `did_a` to find VirtualNode for operating.
     FindVNodeForOperate(VNodeOperation),
-    /// Let `did_a` [notify](Chord::notify) `did_b`.
+    /// Send a predecessor notification to `did_a`.
+    ///
+    /// `did_a` is the remote recipient from [`PeerRingAction::RemoteAction`].
+    /// This field is the predecessor DID announced in `NotifyPredecessorSend`.
     Notify(Did),
     /// Let `did_a` sync data with it's successor.
     SyncVNodeWithSuccessor(Vec<VirtualNode>),
@@ -193,11 +197,28 @@ impl From<Vec<PeerRingAction>> for PeerRingAction {
 impl PeerRing {
     /// Same as new with config, but with a given storage.
     pub fn new_with_storage(did: Did, succ_max: u8, storage: VNodeStorage) -> Self {
+        Self::new_with_storage_and_finger_table_size(
+            did,
+            succ_max,
+            storage,
+            DEFAULT_FINGER_TABLE_SIZE,
+        )
+    }
+
+    /// Same as new with config, but with a given storage and finger table size.
+    ///
+    /// `Did` is 160-bit. Sizes above [`DEFAULT_FINGER_TABLE_SIZE`] are clamped
+    /// by [`FingerTable::new`]; zero is allowed to disable finger maintenance.
+    pub fn new_with_storage_and_finger_table_size(
+        did: Did,
+        succ_max: u8,
+        storage: VNodeStorage,
+        finger_table_size: usize,
+    ) -> Self {
         Self {
             successor_seq: SuccessorSeq::new(did, succ_max),
             predecessor: Arc::new(Mutex::new(None)),
-            // for Eth address, it's 160
-            finger: Arc::new(Mutex::new(FingerTable::new(did, 160))),
+            finger: Arc::new(Mutex::new(FingerTable::new(did, finger_table_size))),
             storage,
             cache: Box::new(MemStorage::new()),
             did,
@@ -339,10 +360,17 @@ impl Chord<PeerRingAction> for PeerRing {
     /// According to the paper, this method should be called periodically.
     /// According to the paper, only one finger should be fixed at a time.
     fn fix_fingers(&self) -> Result<PeerRingAction> {
-        let mut fix_finger_index = self.lock_finger()?.fix_finger_index;
+        let (mut fix_finger_index, finger_table_size) = {
+            let finger = self.lock_finger()?;
+            (finger.fix_finger_index, finger.slot_count())
+        };
+
+        if finger_table_size == 0 {
+            return Ok(PeerRingAction::None);
+        }
 
         // Only one finger should be fixed at a time.
-        fix_finger_index = (fix_finger_index + 1) % 160;
+        fix_finger_index = (fix_finger_index + 1) % finger_table_size;
 
         // Get finger did.
         let finger_did = Did::from(BigUint::from(2u16).pow(fix_finger_index as u32));
@@ -594,29 +622,42 @@ impl CorrectChord<PeerRingAction> for PeerRing {
     }
 
     /// Stabilize Operation:
-    /// Perform stabilization for the successor list.
+    ///
+    /// Mirrors the TLA+-style `CorrectStabilize` operator in
+    /// `tests/default/dht_convergence.rs`.
+    /// The old head is captured before updating successors for the improved-successor
+    /// query check; the remote successor list contributes `but_last`; and notify
+    /// is emitted for the post-update head when that head is not self.
     fn stabilize(&self, info: TopoInfo) -> Result<PeerRingAction> {
         let mut ret = vec![];
         let successors = self.successors();
+        let old_head = if successors.is_empty()? {
+            None
+        } else {
+            Some(successors.min()?)
+        };
         let succ_len = info.successors.len();
-        let but_last = &info.successors[..succ_len - 1].to_vec();
+        let but_last = &info.successors[..succ_len.saturating_sub(1)].to_vec();
+        let improved_successor = info.predecessor.filter(|new_succ| {
+            *new_succ != self.did
+                && old_head.is_none_or(|head| self.bias(*new_succ) < self.bias(head))
+        });
         if let Some(new_succ) = info.predecessor {
             successors.update(new_succ)?;
         }
         successors.extend(but_last)?;
-        // Check if the new successor is between  new_succ and head(successors).
-        if let Some(new_succ) = info.predecessor {
-            if self.bias(new_succ) < self.bias(successors.min()?) {
-                // If new_succ is between self.did and the head of the successor list,
-                // query newSucc for its successor list.
-                ret.push(PeerRingAction::RemoteAction(
-                    new_succ,
-                    RemoteAction::QueryForSuccessorList,
-                ));
-            }
-            // Notify the node's minimum successor of its existence.
+        // Check if new_succ was between self.did and the old head of successors.
+        if let Some(new_succ) = improved_successor {
             ret.push(PeerRingAction::RemoteAction(
-                successors.min()?,
+                new_succ,
+                RemoteAction::QueryForSuccessorList,
+            ));
+        }
+        // Notify the node's minimum successor of its existence.
+        let head = successors.min()?;
+        if head != self.did {
+            ret.push(PeerRingAction::RemoteAction(
+                head,
                 RemoteAction::Notify(self.did),
             ));
         }
@@ -867,6 +908,22 @@ mod tests {
         assert!(
             node2.lock_finger()?.contains(Some(did1)),
             "did2:{did2:?} dont contains did1:{did1:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_correct_chord_stabilize_handles_empty_successor_info() -> Result<()> {
+        let did = Did::from_str("0x051cf4f8d020cb910474bef3e17f153fface2b5f").unwrap();
+        let node = PeerRing::new_with_storage(did, 3, Box::new(MemStorage::new()));
+
+        assert_eq!(
+            node.stabilize(TopoInfo {
+                successors: vec![],
+                predecessor: None,
+            })?,
+            PeerRingAction::MultiActions(vec![])
         );
 
         Ok(())

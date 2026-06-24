@@ -10,6 +10,9 @@ use serde::Serialize;
 
 use crate::dht::Did;
 
+/// Default number of Chord finger slots for a 160-bit `Did`.
+pub const DEFAULT_FINGER_TABLE_SIZE: usize = 160;
+
 /// Finger table of Chord DHT
 /// Ring's finger table is implemented with BiasRing
 #[derive(Derivative, Clone, Debug, Serialize, Deserialize)]
@@ -19,12 +22,18 @@ pub struct FingerTable {
     size: usize,
     finger: Vec<Option<Did>>,
     #[derivative(PartialEq = "ignore")]
-    pub(super) fix_finger_index: u8,
+    pub(super) fix_finger_index: usize,
 }
 
 impl FingerTable {
     /// builder
+    ///
+    /// `Did` is represented by H160, so finger slots above 160 would wrap the
+    /// `2^index` lookup target back into the same 160-bit space. Values above
+    /// [`DEFAULT_FINGER_TABLE_SIZE`] are clamped; zero is allowed for tests that
+    /// intentionally disable finger maintenance.
     pub fn new(did: Did, size: usize) -> Self {
+        let size = size.min(DEFAULT_FINGER_TABLE_SIZE);
         Self {
             did,
             size,
@@ -82,7 +91,7 @@ impl FingerTable {
 
     /// setter for fix_finger_index
     pub fn set_fix(&mut self, did: Did) {
-        let index = self.fix_finger_index as usize;
+        let index = self.fix_finger_index;
         self.set(index, did)
     }
 
@@ -164,6 +173,11 @@ impl FingerTable {
         self.finger.iter().flatten().count()
     }
 
+    /// Get the number of slots in this finger table.
+    pub fn slot_count(&self) -> usize {
+        self.size
+    }
+
     /// get finger list
     pub fn list(&self) -> &Vec<Option<Did>> {
         &self.finger
@@ -193,6 +207,17 @@ impl Index<usize> for FingerTable {
 mod test {
     use super::*;
     use crate::dht::tests::gen_ordered_dids;
+
+    #[test]
+    fn test_finger_table_size_bounds() {
+        let did = gen_ordered_dids(1)[0];
+
+        assert_eq!(
+            FingerTable::new(did, DEFAULT_FINGER_TABLE_SIZE + 1).slot_count(),
+            DEFAULT_FINGER_TABLE_SIZE
+        );
+        assert_eq!(FingerTable::new(did, 0).slot_count(), 0);
+    }
 
     #[test]
     fn test_finger_table_get_set_remove() {
