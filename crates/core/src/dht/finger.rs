@@ -1,7 +1,6 @@
 //! FingerTable
 
 #![warn(missing_docs)]
-use std::ops::Index;
 
 use derivative::Derivative;
 use num_bigint::BigUint;
@@ -49,30 +48,18 @@ impl FingerTable {
 
     /// Get first element from Finger Table
     pub fn first(&self) -> Option<Did> {
-        let ids = self
-            .finger
-            .iter()
-            .filter(|x| x.is_some())
-            .take(1)
-            .map(|x| x.unwrap())
-            .collect::<Vec<Did>>();
-        ids.first().copied()
+        self.finger.iter().flatten().next().copied()
     }
 
     /// getter
     pub fn get(&self, index: usize) -> Option<Did> {
-        if index >= self.finger.len() {
-            return None;
-        }
-        self.finger[index]
+        self.finger.get(index).copied().flatten()
     }
 
-    /// ref getter
-    pub fn get_ref(&self, index: usize) -> &Option<Did> {
-        if index >= self.finger.len() {
-            return &None;
+    fn write_slot(&mut self, index: usize, did: Option<Did>) {
+        if let Some(slot) = self.finger.get_mut(index) {
+            *slot = did;
         }
-        &self.finger[index]
     }
 
     /// setter
@@ -86,7 +73,7 @@ impl FingerTable {
             tracing::trace!("set finger table with self did, ignore it");
             return;
         }
-        self.finger[index] = Some(did);
+        self.write_slot(index, Some(did));
     }
 
     /// setter for fix_finger_index
@@ -105,24 +92,17 @@ impl FingerTable {
             .map(|(id, _)| id)
             .collect();
 
-        if let Some(last_idx) = indexes.last() {
-            let (first_idx, end_idx) = (*indexes.first().unwrap(), *last_idx + 1);
+        if let (Some(first_idx), Some(last_idx)) =
+            (indexes.first().copied(), indexes.last().copied())
+        {
+            let end_idx = last_idx + 1;
 
             // Update to the next did of last equaled did in finger table.
             // If cannot get that, use None.
-            let fix_id = self
-                .finger
-                .iter()
-                .skip(end_idx)
-                .take(1)
-                .collect::<Vec<_>>()
-                .first()
-                .unwrap_or(&&None)
-                .as_ref()
-                .copied();
+            let fix_id = self.finger.get(end_idx).copied().flatten();
 
             for idx in first_idx..end_idx {
-                self.finger[idx] = fix_id
+                self.write_slot(idx, fix_id);
             }
         }
     }
@@ -131,20 +111,23 @@ impl FingerTable {
     pub fn join(&mut self, did: Did) {
         let bias = did.bias(self.did);
 
-        for k in 0u32..self.size as u32 {
-            let pos = Did::from(BigUint::from(2u16).pow(k));
+        for k in 0..self.size {
+            let Ok(exponent) = u32::try_from(k) else {
+                continue;
+            };
+            let pos = Did::from(BigUint::from(2u16).pow(exponent));
 
             if bias.pos() < pos {
                 continue;
             }
 
-            if let Some(v) = self.finger[k as usize] {
+            if let Some(v) = self.finger.get(k).copied().flatten() {
                 if bias > v.bias(self.did) {
                     continue;
                 }
             }
 
-            self.finger[k as usize] = Some(did);
+            self.write_slot(k, Some(did));
         }
     }
 
@@ -158,7 +141,7 @@ impl FingerTable {
         let bias = did.bias(self.did);
 
         for i in (0..self.size).rev() {
-            if let Some(v) = self.finger[i] {
+            if let Some(v) = self.finger.get(i).copied().flatten() {
                 if v.bias(self.did) < bias {
                     return v;
                 }
@@ -193,13 +176,6 @@ impl FingerTable {
     #[cfg(test)]
     pub fn clone_finger(self) -> Vec<Option<Did>> {
         self.finger
-    }
-}
-
-impl Index<usize> for FingerTable {
-    type Output = Option<Did>;
-    fn index(&self, index: usize) -> &Self::Output {
-        self.get_ref(index)
     }
 }
 

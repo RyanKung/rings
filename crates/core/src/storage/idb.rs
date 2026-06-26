@@ -5,7 +5,6 @@ use std::ops::Add;
 use std::ops::Sub;
 
 use async_trait::async_trait;
-use itertools::Itertools;
 use rexie::Index;
 use rexie::ObjectStore;
 use rexie::Rexie;
@@ -45,6 +44,17 @@ impl<T> DataStruct<T> {
             data,
         }
     }
+}
+
+/// Compute the next per-key IndexedDB visit timestamp.
+pub(crate) fn next_visit_time_after(previous: i64, now: i64) -> i64 {
+    // Post: for previous < i64::MAX, result > previous. The prune index
+    // remains monotonic per key under equal-ms or backward wall-clock readings.
+    now.max(previous.saturating_add(1))
+}
+
+fn next_visit_time(previous: i64) -> i64 {
+    next_visit_time_after(previous, chrono::Utc::now().timestamp_millis())
 }
 
 /// StorageInstance struct
@@ -153,7 +163,7 @@ where V: DeserializeOwned + Serialize + Sized
         let v = store.get(&k).await.map_err(Error::IDBError)?;
         let v: Option<DataStruct<V>> = js_value::deserialize(&v)?;
         if let Some(mut v) = v {
-            v.last_visit_time = chrono::Utc::now().timestamp_millis();
+            v.last_visit_time = next_visit_time(v.last_visit_time);
             v.visit_count += 1;
             store
                 .put(
@@ -187,15 +197,16 @@ where V: DeserializeOwned + Serialize + Sized
             .await
             .map_err(Error::IDBError)?;
 
-        Ok(entries
+        entries
             .iter()
             .map(|(k, v)| {
-                (
-                    k.as_string().unwrap(),
-                    js_value::deserialize::<DataStruct<V>>(v).unwrap().data,
-                )
+                let key = k
+                    .as_string()
+                    .ok_or_else(|| Error::JsError("IndexedDB key is not a string".to_string()))?;
+                let data = js_value::deserialize::<DataStruct<V>>(v)?.data;
+                Ok((key, data))
             })
-            .collect_vec())
+            .collect()
     }
 
     async fn remove(&self, key: &str) -> Result<()> {

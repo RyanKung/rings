@@ -46,6 +46,17 @@ impl IceServer {
     }
 }
 
+/// Parse ICE servers, log invalid configuration, and continue without servers.
+pub(crate) fn parse_ice_servers_or_warn(config: &str, transport: &str) -> Vec<IceServer> {
+    match IceServer::vec_from_str(config) {
+        Ok(ice_servers) => ice_servers,
+        Err(error) => {
+            tracing::warn!(%error, %transport, "Ignoring invalid ICE server configuration");
+            Vec::new()
+        }
+    }
+}
+
 impl Default for IceServer {
     fn default() -> Self {
         Self {
@@ -75,8 +86,7 @@ impl FromStr for IceServer {
         }
         let username = parsed.username();
         let password = parsed.password().unwrap_or("");
-        // must have host
-        let host = parsed.host_str().unwrap();
+        let host = parsed.host_str().ok_or(IceServerError::UrlMissHost)?;
         // parse port as `:<port>`
         let port = parsed
             .port()
@@ -129,5 +139,11 @@ mod test {
         assert_eq!(ret_d.username, "ryan".to_string());
 
         assert!(ret_e.is_err());
+    }
+
+    #[test]
+    fn parsing_rejects_missing_host() {
+        let parsed = IceServer::from_str("stun:///missing-host");
+        assert!(parsed.is_err());
     }
 }
