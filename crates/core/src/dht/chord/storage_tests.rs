@@ -28,27 +28,15 @@ use crate::storage::KvStorageInterface;
 use crate::storage::MemStorage;
 
 fn data_entry(did: Did) -> Entry {
-    Entry {
-        did,
-        data: vec![],
-        kind: EntryKind::Data,
-    }
+    Entry::new(did, vec![], EntryKind::Data)
 }
 
 fn data_entry_with_data(did: Did, data: &str) -> Entry {
-    Entry {
-        did,
-        data: vec![data.into()],
-        kind: EntryKind::Data,
-    }
+    Entry::new(did, vec![data.into()], EntryKind::Data)
 }
 
 fn data_entry_with_payload_len(did: Did, len: usize) -> Entry {
-    Entry {
-        did,
-        data: vec!["x".repeat(len).into()],
-        kind: EntryKind::Data,
-    }
+    Entry::new(did, vec!["x".repeat(len).into()], EntryKind::Data)
 }
 
 fn first_two_affine_keys(did: Did) -> Result<(Did, Did)> {
@@ -88,7 +76,7 @@ fn collect_sync_batches_into(
             }
             Ok(())
         }
-        act => Err(Error::PeerRingUnexpectedAction(act)),
+        act => Err(Error::unexpected_peer_ring_action(act)),
     }
 }
 
@@ -511,7 +499,7 @@ async fn local_hit_lookup_has_no_read_repair_targets() -> Result<()> {
     let action = <PeerRing as ChordStorage<_, 2>>::entry_lookup(&node, entry.did).await?;
     let evidence = match action {
         PeerRingAction::SomeEntry(evidence) => evidence,
-        action => return Err(Error::PeerRingUnexpectedAction(action)),
+        action => return Err(Error::unexpected_peer_ring_action(action)),
     };
     let repair = node
         .read_repair_entry(evidence.entry.clone(), &evidence.misses)
@@ -542,7 +530,7 @@ async fn read_repair_targets_only_observed_missing_placements() -> Result<()> {
     let action = <PeerRing as ChordStorage<_, 3>>::entry_lookup(&node, entry.did).await?;
     let evidence = match action {
         PeerRingAction::SomeEntry(evidence) => evidence,
-        action => return Err(Error::PeerRingUnexpectedAction(action)),
+        action => return Err(Error::unexpected_peer_ring_action(action)),
     };
     let repair = node
         .read_repair_entry(evidence.entry.clone(), &evidence.misses)

@@ -60,14 +60,14 @@ pub trait ChordStorageInterfaceCacheChecker {
 fn finish_storage_action(act: PeerRingAction) -> Result<()> {
     match act {
         PeerRingAction::None => Ok(()),
-        act => Err(Error::PeerRingUnexpectedAction(act)),
+        act => Err(Error::unexpected_peer_ring_action(act)),
     }
 }
 
 fn finish_storage_action_ref(act: &PeerRingAction) -> Result<()> {
     match act {
         PeerRingAction::None => Ok(()),
-        act => Err(Error::PeerRingUnexpectedAction(act.clone())),
+        act => Err(Error::unexpected_peer_ring_action(act.clone())),
     }
 }
 
@@ -290,11 +290,10 @@ async fn persist_synced_entries(
 ) -> Result<Vec<SyncedEntryAck>> {
     let mut acks = Vec::with_capacity(msg.data.len());
     for placed in msg.data.iter() {
-        let entry = placed.entry.clone().into_storage_entry();
+        let entry = placed.entry.clone().try_into_storage_entry()?;
         handler
             .dht
-            .storage
-            .put(&placed.key.to_string(), &entry)
+            .join_storage_entry(placed.key, entry.clone())
             .await?;
         acks.push(SyncedEntryAck::new(placed.key, entry));
     }
@@ -315,7 +314,7 @@ fn next_hop_for_sync_entries(
         PeerRingAction::RemoteAction(next, PeerRingRemoteAction::FindSuccessor(_)) => {
             Ok(Some(next))
         }
-        action => Err(Error::PeerRingUnexpectedAction(action)),
+        action => Err(Error::unexpected_peer_ring_action(action)),
     }
 }
 
@@ -514,6 +513,28 @@ mod test {
             .ok_or_else(|| Error::InvalidMessage("expected generated key".to_string()))
     }
 
+    async fn assert_cached_data_values(
+        node: &Node,
+        entry_key: Did,
+        expected: &[&str],
+    ) -> Result<()> {
+        let entry = node
+            .swarm
+            .storage_check_cache(entry_key)
+            .await
+            .ok_or_else(|| Error::InvalidMessage("expected cached entry".to_string()))?;
+        let expected_data = expected
+            .iter()
+            .map(|value| value.to_string().encode())
+            .collect::<Result<Vec<_>>>()?;
+
+        assert_eq!(entry.did, entry_key);
+        assert_eq!(entry.kind, EntryKind::Data);
+        assert_eq!(entry.data, expected_data);
+        assert_eq!(entry.crdt.dots.len(), entry.data.len());
+        Ok(())
+    }
+
     #[test]
     fn finish_storage_action_accepts_empty_action() -> Result<()> {
         finish_storage_action(PeerRingAction::None)?;
@@ -525,8 +546,8 @@ mod test {
     fn finish_storage_action_rejects_unhandled_action() -> Result<()> {
         let did = SecretKey::random().address().into();
         match finish_storage_action(PeerRingAction::Some(did)) {
-            Err(Error::PeerRingUnexpectedAction(PeerRingAction::Some(actual))) => {
-                assert_eq!(actual, did);
+            Err(Error::PeerRingUnexpectedAction(action)) => {
+                assert_eq!(*action, PeerRingAction::Some(did));
                 Ok(())
             }
             res => Err(Error::InvalidMessage(format!(
@@ -541,11 +562,12 @@ mod test {
         let handler = MessageHandler::new(node.swarm.transport.clone(), Arc::new(NoopCallback));
         let resource_id = Did::from(10u32);
         let placement_key = Did::from(100u32);
-        let entry = Entry {
-            did: resource_id,
-            data: vec!["placed".to_string().encode()?],
-            kind: EntryKind::Data,
-        };
+        let entry = Entry::new(
+            resource_id,
+            vec!["placed".to_string().encode()?],
+            EntryKind::Data,
+        );
+        let stored_entry = entry.clone().try_into_storage_entry()?;
         let context_key = SecretKey::random();
         let context_session = SessionSk::new_with_seckey(&context_key)?;
         let context = MessagePayload::new_send(
@@ -563,7 +585,7 @@ mod test {
 
         assert_eq!(
             node.dht().storage.get(&placement_key.to_string()).await?,
-            Some(entry)
+            Some(stored_entry)
         );
         assert_eq!(
             node.dht().storage.get(&resource_id.to_string()).await?,
@@ -577,13 +599,13 @@ mod test {
         let node = prepare_node(SecretKey::random()).await;
         let handler = MessageHandler::new(node.swarm.transport.clone(), Arc::new(NoopCallback));
         let placement_key = Did::from(100u32);
-        let entry = Entry {
-            did: Did::from(10u32),
-            data: (0..ENTRY_DATA_MAX_LEN + 3)
+        let entry = Entry::new(
+            Did::from(10u32),
+            (0..ENTRY_DATA_MAX_LEN + 3)
                 .map(|i| format!("payload{i}").encode())
                 .collect::<Result<Vec<_>>>()?,
-            kind: EntryKind::Data,
-        };
+            EntryKind::Data,
+        );
         let context_key = SecretKey::random();
         let context_session = SessionSk::new_with_seckey(&context_key)?;
         let context = MessagePayload::new_send(
@@ -627,11 +649,12 @@ mod test {
 
         let handler = MessageHandler::new(node1.swarm.transport.clone(), Arc::new(NoopCallback));
         let placement_key = node2.did();
-        let entry = Entry {
-            did: Did::from(10u32),
-            data: vec!["routed repair".to_string().encode()?],
-            kind: EntryKind::Data,
-        };
+        let entry = Entry::new(
+            Did::from(10u32),
+            vec!["routed repair".to_string().encode()?],
+            EntryKind::Data,
+        );
+        let stored_entry = entry.clone().try_into_storage_entry()?;
         let msg = SyncEntriesWithSuccessor {
             data: vec![PlacedEntry::new(placement_key, entry.clone())],
         };
@@ -656,7 +679,7 @@ mod test {
         assert!(matches!(
             ack.transaction.data()?,
             Message::SyncEntriesWithSuccessorReport(SyncEntriesWithSuccessorReport { acks })
-                if acks == vec![SyncedEntryAck::new(placement_key, entry.clone())]
+                if acks == vec![SyncedEntryAck::new(placement_key, stored_entry.clone())]
         ));
         assert_eq!(
             node1.dht().storage.get(&placement_key.to_string()).await?,
@@ -664,7 +687,7 @@ mod test {
         );
         assert_eq!(
             node2.dht().storage.get(&placement_key.to_string()).await?,
-            Some(entry)
+            Some(stored_entry)
         );
         Ok(())
     }
@@ -686,11 +709,7 @@ mod test {
         let node = Node::new(swarm);
         let departed = Did::from(100u32);
         node.dht().successors().update(departed)?;
-        let entry = Entry {
-            did: key.address().into(),
-            data: vec![],
-            kind: EntryKind::Data,
-        };
+        let entry = Entry::new(key.address().into(), vec![], EntryKind::Data);
         let placement_keys = entry.did.rotate_affine(2)?;
         node.dht()
             .storage
@@ -743,11 +762,11 @@ mod test {
             .build(),
         );
         let node = Node::new(swarm);
-        let entry = Entry {
-            did: key.address().into(),
-            data: vec!["local".to_string().encode()?],
-            kind: EntryKind::Data,
-        };
+        let entry = Entry::new(
+            key.address().into(),
+            vec!["local".to_string().encode()?],
+            EntryKind::Data,
+        );
         let first_key = entry
             .did
             .rotate_affine(2)?
@@ -770,11 +789,12 @@ mod test {
     async fn found_entry_repairs_buffered_misses_only() -> Result<()> {
         let node = prepare_node(SecretKey::random()).await;
         let handler = MessageHandler::new(node.swarm.transport.clone(), Arc::new(NoopCallback));
-        let entry = Entry {
-            did: Did::from(10u32),
-            data: vec!["repair".to_string().encode()?],
-            kind: EntryKind::Data,
-        };
+        let entry = Entry::new(
+            Did::from(10u32),
+            vec!["repair".to_string().encode()?],
+            EntryKind::Data,
+        );
+        let stored_entry = entry.clone().try_into_storage_entry()?;
         let placement_key = Did::from(100u32);
         let unknown_key = Did::from(120u32);
         let context_key = SecretKey::random();
@@ -810,7 +830,7 @@ mod test {
 
         assert_eq!(
             node.dht().storage.get(&placement_key.to_string()).await?,
-            Some(entry)
+            Some(stored_entry)
         );
         assert_eq!(
             node.dht().storage.get(&unknown_key.to_string()).await?,
@@ -824,16 +844,16 @@ mod test {
         let node = prepare_node(SecretKey::random()).await;
         let handler = MessageHandler::new(node.swarm.transport.clone(), Arc::new(NoopCallback));
         let resource = Did::from(10u32);
-        let first = Entry {
-            did: resource,
-            data: vec!["first".to_string().encode()?],
-            kind: EntryKind::Data,
-        };
-        let second = Entry {
-            did: resource,
-            data: vec!["second".to_string().encode()?],
-            kind: EntryKind::Data,
-        };
+        let first = Entry::new(
+            resource,
+            vec!["first".to_string().encode()?],
+            EntryKind::Data,
+        );
+        let second = Entry::new(
+            resource,
+            vec!["second".to_string().encode()?],
+            EntryKind::Data,
+        );
         let context_key = SecretKey::random();
         let context_session = SessionSk::new_with_seckey(&context_key)?;
         let context = MessagePayload::new_send(
@@ -904,11 +924,11 @@ mod test {
     async fn expired_storage_misses_do_not_trigger_late_repair() -> Result<()> {
         let node = prepare_node(SecretKey::random()).await;
         let handler = MessageHandler::new(node.swarm.transport.clone(), Arc::new(NoopCallback));
-        let entry = Entry {
-            did: Did::from(10u32),
-            data: vec!["fresh".to_string().encode()?],
-            kind: EntryKind::Data,
-        };
+        let entry = Entry::new(
+            Did::from(10u32),
+            vec!["fresh".to_string().encode()?],
+            EntryKind::Data,
+        );
         let placement_key = Did::from(100u32);
         let context_key = SecretKey::random();
         let context_session = SessionSk::new_with_seckey(&context_key)?;
@@ -961,11 +981,12 @@ mod test {
 
         let handler = MessageHandler::new(receiver.swarm.transport.clone(), Arc::new(NoopCallback));
         let placement_key = Did::from(100u32);
-        let entry = Entry {
-            did: Did::from(10u32),
-            data: vec!["acked".to_string().encode()?],
-            kind: EntryKind::Data,
-        };
+        let entry = Entry::new(
+            Did::from(10u32),
+            vec!["acked".to_string().encode()?],
+            EntryKind::Data,
+        );
+        let stored_entry = entry.clone().try_into_storage_entry()?;
         let sync_msg = SyncEntriesWithSuccessor {
             data: vec![PlacedEntry::new(placement_key, entry.clone())],
         };
@@ -983,7 +1004,7 @@ mod test {
             Message::SyncEntriesWithSuccessorReport(report) => {
                 assert_eq!(report.acks, vec![SyncedEntryAck::new(
                     placement_key,
-                    entry.clone()
+                    stored_entry.clone()
                 )]);
             }
             message => {
@@ -998,7 +1019,7 @@ mod test {
                 .storage
                 .get(&placement_key.to_string())
                 .await?,
-            Some(entry)
+            Some(stored_entry)
         );
         Ok(())
     }
@@ -1009,16 +1030,8 @@ mod test {
         let handler = MessageHandler::new(node.swarm.transport.clone(), Arc::new(NoopCallback));
         let acked_key = Did::from(100u32);
         let pending_key = Did::from(120u32);
-        let acked_entry = Entry {
-            did: Did::from(10u32),
-            data: vec![],
-            kind: EntryKind::Data,
-        };
-        let pending_entry = Entry {
-            did: Did::from(20u32),
-            data: vec![],
-            kind: EntryKind::Data,
-        };
+        let acked_entry = Entry::new(Did::from(10u32), vec![], EntryKind::Data);
+        let pending_entry = Entry::new(Did::from(20u32), vec![], EntryKind::Data);
         let context = MessagePayload::new_send(
             Message::custom(b"sync ack context")?,
             node.swarm.transport.session_sk(),
@@ -1111,14 +1124,7 @@ mod test {
                     && x.data.first().is_some_and(|entry| entry.did == entry_key)
         ));
 
-        assert_eq!(
-            node1.swarm.storage_check_cache(entry_key).await,
-            Some(Entry {
-                did: entry_key,
-                data: vec![data.encode()?],
-                kind: EntryKind::Data
-            })
-        );
+        assert_cached_data_values(&node1, entry_key, &[data.as_str()]).await?;
 
         Ok(())
     }
@@ -1182,14 +1188,7 @@ mod test {
         wait_for_msgs([&node1, &node2]).await;
         assert_no_more_msg([&node1, &node2]).await;
 
-        assert_eq!(
-            node1.swarm.storage_check_cache(entry_key).await,
-            Some(Entry {
-                did: entry_key,
-                data: vec!["111".to_string().encode()?, "222".to_string().encode()?],
-                kind: EntryKind::Data
-            })
-        );
+        assert_cached_data_values(&node1, entry_key, &["111", "222"]).await?;
 
         // Append more data
         <Swarm as ChordStorageInterface<1>>::storage_append_data(
@@ -1207,18 +1206,7 @@ mod test {
         wait_for_msgs([&node1, &node2]).await;
         assert_no_more_msg([&node1, &node2]).await;
 
-        assert_eq!(
-            node1.swarm.storage_check_cache(entry_key).await,
-            Some(Entry {
-                did: entry_key,
-                data: vec![
-                    "111".to_string().encode()?,
-                    "222".to_string().encode()?,
-                    "333".to_string().encode()?
-                ],
-                kind: EntryKind::Data
-            })
-        );
+        assert_cached_data_values(&node1, entry_key, &["111", "222", "333"]).await?;
 
         Ok(())
     }
@@ -1265,18 +1253,7 @@ mod test {
         wait_for_msgs([&node1, &node2]).await;
         assert_no_more_msg([&node1, &node2]).await;
 
-        assert_eq!(
-            node1.swarm.storage_check_cache(entry_key).await,
-            Some(Entry {
-                did: entry_key,
-                data: vec![
-                    "111".to_string().encode()?,
-                    "333".to_string().encode()?,
-                    "222".to_string().encode()?
-                ],
-                kind: EntryKind::Data
-            })
-        );
+        assert_cached_data_values(&node1, entry_key, &["111", "333", "222"]).await?;
 
         Ok(())
     }

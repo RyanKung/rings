@@ -38,7 +38,7 @@ fn collect_sync_entries_actions(
             }
             Ok(())
         }
-        action => Err(Error::PeerRingUnexpectedAction(action)),
+        action => Err(Error::unexpected_peer_ring_action(action)),
     }
 }
 
@@ -183,11 +183,12 @@ mod test {
         wait_for_msgs([&node1, &node2]).await;
         assert_no_more_msg([&node1, &node2]).await;
 
-        let entry = Entry {
-            did: key3.address().into(),
-            data: vec![String::from("sync me").encode()?],
-            kind: EntryKind::Data,
-        };
+        let entry = Entry::new(
+            key3.address().into(),
+            vec![String::from("sync me").encode()?],
+            EntryKind::Data,
+        );
+        let stored_entry = entry.clone().try_into_storage_entry()?;
         node1
             .dht()
             .storage
@@ -248,7 +249,10 @@ mod test {
 
         match payload.transaction.data::<Message>()? {
             Message::SyncEntriesWithSuccessorReport(SyncEntriesWithSuccessorReport { acks }) => {
-                assert_eq!(acks, vec![SyncedEntryAck::new(entry.did, entry.clone())]);
+                assert_eq!(acks, vec![SyncedEntryAck::new(
+                    entry.did,
+                    stored_entry.clone()
+                )]);
             }
             message => {
                 return Err(Error::InvalidMessage(format!(
@@ -259,7 +263,7 @@ mod test {
         assert_eq!(node1.dht().storage.get(&entry.did.to_string()).await?, None);
         assert_eq!(
             node2.dht().storage.get(&entry.did.to_string()).await?,
-            Some(entry)
+            Some(stored_entry)
         );
 
         Ok(())

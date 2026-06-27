@@ -58,6 +58,15 @@ pub enum Error {
     #[error("The type of Entry is not allowed to be joined as a subring")]
     EntryNotJoinable,
 
+    #[error("The type of Entry is not allowed to be tombstoned")]
+    EntryNotTombstonable,
+
+    #[error("Entry dot index {index} is out of bounds")]
+    EntryDotIndexOutOfBounds {
+        /// Dot index that could not be represented.
+        index: usize,
+    },
+
     #[error("Affine rotation scalar must be greater than zero")]
     InvalidAffineScalar,
 
@@ -186,7 +195,7 @@ pub enum Error {
     PeerRingInvalidEntry,
 
     #[error("Unexpected PeerRingAction, {0:?}")]
-    PeerRingUnexpectedAction(crate::dht::PeerRingAction),
+    PeerRingUnexpectedAction(Box<crate::dht::PeerRingAction>),
 
     #[error("PeerRing findsuccessor error, {0}")]
     PeerRingFindSuccessor(String),
@@ -405,6 +414,12 @@ pub enum Error {
 
     #[error("External Javascript error: {0}")]
     JsError(String),
+}
+
+impl Error {
+    pub(crate) fn unexpected_peer_ring_action(action: crate::dht::PeerRingAction) -> Self {
+        Self::PeerRingUnexpectedAction(Box::new(action))
+    }
 }
 
 #[cfg(feature = "wasm")]

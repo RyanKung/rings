@@ -13,6 +13,7 @@ use crate::dht::Did;
 use crate::dht::PeerRing;
 use crate::dht::PeerRingAction;
 use crate::dht::PeerRingRemoteAction;
+use crate::error::Error;
 use crate::error::Result;
 use crate::message::FindSuccessorReportHandler;
 use crate::message::FindSuccessorSend;
@@ -95,7 +96,7 @@ impl Stabilizer {
             }
             action => {
                 tracing::error!("Invalid storage repair action: {action:?}");
-                Err(crate::error::Error::PeerRingUnexpectedAction(action))
+                Err(crate::error::Error::unexpected_peer_ring_action(action))
             }
         }
     }
@@ -180,12 +181,17 @@ impl Stabilizer {
                 PeerRingAction::None => Ok(()),
                 PeerRingAction::RemoteAction(
                     closest_predecessor,
-                    PeerRingRemoteAction::FindSuccessorForFix(finger_did),
+                    PeerRingRemoteAction::FindSuccessorForFix {
+                        did: finger_did,
+                        index,
+                    },
                 ) => {
                     tracing::debug!("STABILIZATION fix_fingers: {:?}", finger_did);
                     let msg = Message::FindSuccessorSend(FindSuccessorSend {
                         did: finger_did,
-                        then: FindSuccessorThen::Report(FindSuccessorReportHandler::FixFingerTable),
+                        then: FindSuccessorThen::Report(
+                            FindSuccessorReportHandler::FixFingerTable { index },
+                        ),
                         strict: false,
                     });
                     let payload = MessagePayload::new_send(
@@ -199,7 +205,7 @@ impl Stabilizer {
                 }
                 _ => {
                     tracing::error!("Invalid PeerRing Action");
-                    unreachable!();
+                    Err(Error::PeerRingInvalidAction)
                 }
             },
             Err(e) => {

@@ -144,7 +144,7 @@ impl HandleMsg<FindSuccessorSend> for MessageHandler {
                 self.run_effects([PayloadRelayFunctor::reset_destination(ctx, next).into()])
                     .await
             }
-            act => Err(Error::PeerRingUnexpectedAction(act)),
+            act => Err(Error::unexpected_peer_ring_action(act)),
         }
     }
 }
@@ -160,7 +160,22 @@ impl HandleMsg<FindSuccessorReport> for MessageHandler {
         }
 
         match &msg.handler {
-            FindSuccessorReportHandler::FixFingerTable | FindSuccessorReportHandler::Connect => {
+            FindSuccessorReportHandler::FixFingerTable { index } => {
+                self.dht.apply_fixed_finger(*index, msg.did)?;
+                if msg.reports_remote_successor(self.dht.did) {
+                    let offer_msg = self
+                        .transport
+                        .prepare_connection_offer(msg.did, self.inner_callback())
+                        .await?;
+                    self.run_effects([MessageSendFunctor::send_message(
+                        Message::ConnectNodeSend(offer_msg),
+                        msg.did,
+                    )
+                    .into()])
+                        .await?;
+                }
+            }
+            FindSuccessorReportHandler::Connect => {
                 if msg.reports_remote_successor(self.dht.did) {
                     let offer_msg = self
                         .transport
