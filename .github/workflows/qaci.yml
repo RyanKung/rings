@@ -13,6 +13,9 @@ env:
   CARGO_TERM_COLOR: always
   WASM_BINDGEN_TEST_TIMEOUT: 120
 
+permissions:
+  contents: read
+
 jobs:
   # Build every release target (macOS, static-musl linux, browser) on each PR via the shared
   # reusable workflow, so a release-only build failure (static-musl C++ linking, or the browser
@@ -157,7 +160,7 @@ jobs:
       - uses: actions/checkout@v3
 
       - name: Check typos
-        uses: crate-ci/typos@master
+        uses: crate-ci/typos@v1.47.2
 
       - name: Setup protoc
         uses: arduino/setup-protoc@v2.1.0
