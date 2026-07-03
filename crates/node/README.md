@@ -1,24 +1,20 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://static.ringsnetwork.io/ringsnetwork_logo.png">
-  <img alt="Rings Network" src="https://raw.githubusercontent.com/RingsNetwork/asserts/main/logo/rings_network_red.png">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/RyanKung/rings/master/assets/logo/rings_network_red.png">
+  <img alt="Rings Network" src="https://raw.githubusercontent.com/RyanKung/rings/master/assets/logo/rings_network_black.svg">
 </picture>
 
 Rings Node (The node service of Rings Network)
 ===============
 
-[![rings-node](https://github.com/RingsNetwork/rings-node/actions/workflows/auto-release.yml/badge.svg)](https://github.com/RingsNetwork/rings-node/actions/workflows/auto-release.yml)
+[![rings-node](https://github.com/RyanKung/rings/actions/workflows/auto-release.yml/badge.svg)](https://github.com/RyanKung/rings/actions/workflows/auto-release.yml)
 [![cargo](https://img.shields.io/crates/v/rings-node.svg)](https://crates.io/crates/rings-node)
 [![docs](https://docs.rs/rings-node/badge.svg)](https://docs.rs/rings-node/latest/rings_node/)
-![GitHub](https://img.shields.io/github/license/RingsNetwork/rings-node)
+![GitHub](https://img.shields.io/github/license/RyanKung/rings)
 
 
 Rings is a structured peer-to-peer network implementation using WebRTC, Chord algorithm, and full WebAssembly (WASM) support.
 
-For more details you can check our [Rings Whitepaper](https://raw.githubusercontent.com/RingsNetwork/whitepaper/master/rings.pdf).
-
-You can also visit [Rings Network's homepage](https://ringsnetwork.io) to get more project info.
-
-And you can get more document [here](https://rings.gitbook.io/).
+For protocol details, see the repository-owned [Rings Whitepaper](../../papers/rings.pdf).
 
 ## Installation
 
@@ -37,8 +33,8 @@ cargo install rings-node
 To install rings-node from source, follow these steps:
 
 ```sh
-git clone git@github.com:RingsNetwork/rings-node.git
-cd ./rings-node
+git clone git@github.com:RyanKung/rings.git
+cd ./rings
 cargo install --path .
 ```
 

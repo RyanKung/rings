@@ -1,28 +1,41 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://static.ringsnetwork.io/ringsnetwork_logo.png">
-  <img alt="Rings Network" src="https://raw.githubusercontent.com/RingsNetwork/asserts/main/logo/rings_network_red.png">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo/rings_network_red.png">
+  <img alt="Rings Network" src="assets/logo/rings_network_black.svg">
 </picture>
 
 Rings Network
 ===============
 
-[![rings-node](https://github.com/RingsNetwork/rings/actions/workflows/auto-release.yml/badge.svg)](https://github.com/RingsNetwork/rings/actions/workflows/auto-release.yml)
+[![rings-node](https://github.com/RyanKung/rings/actions/workflows/auto-release.yml/badge.svg)](https://github.com/RyanKung/rings/actions/workflows/auto-release.yml)
 [![cargo](https://img.shields.io/crates/v/rings-node.svg)](https://crates.io/crates/rings-node)
 [![docs](https://docs.rs/rings-node/badge.svg)](https://docs.rs/rings-node/latest/rings_node/)
-![GitHub](https://img.shields.io/github/license/RingsNetwork/rings)
+![GitHub](https://img.shields.io/github/license/RyanKung/rings)
 [![Sponsor](https://img.shields.io/badge/Sponsor-RingsNetwork-ea4aaa?logo=githubsponsors)](https://github.com/sponsors/RingsNetwork)
 
 The Rings Network aimed at creating a fully decentralized network. It is built upon technologies such as WebRTC, WASM (WebAssembly), and Chord DHT (Distributed Hash Table), enabling direct connections between browsers.
 
 Rings Network allows all traffic to bypass centralized infrastructures, achieving complete decentralization.
 
+## Whitepaper
 
-For more details you can check our [Rings Whitepaper](https://raw.githubusercontent.com/RingsNetwork/whitepaper/master/rings.pdf).
+The canonical protocol paper is maintained in this repository:
 
-You can also visit [Rings Network's homepage](https://ringsnetwork.io) to get more project info.
+- [Rings whitepaper PDF](./papers/rings.pdf)
+- [LaTeX source](./papers/rings.tex)
+- [Paper assets and build notes](./papers/)
 
-And you can get more document [here](https://rings.gitbook.io/).
+If you cite Rings in academic or technical writing, use:
 
+```bibtex
+@misc{rings-network,
+  author = {Ryan J. Kung},
+  title = {Rings: A peer-to-peer network for sovereign age},
+  year = {2023},
+  month = feb,
+  url = {https://github.com/RyanKung/rings/blob/master/papers/rings.pdf},
+  note = {Repository-owned whitepaper and LaTeX source: https://github.com/RyanKung/rings/tree/master/papers}
+}
+```
 
 ## Features
 
@@ -55,8 +68,8 @@ cargo install rings-node
 To install rings-node from source, follow these steps:
 
 ```sh
-git clone git@github.com:RingsNetwork/rings-node.git
-cd ./rings-node
+git clone git@github.com:RyanKung/rings.git
+cd ./rings
 cargo install --path .
 ```
 
@@ -90,7 +103,7 @@ Runnable examples live in [`examples/`](./examples):
 | Example | What it shows |
 |---|---|
 | [`native`](./examples/native) | A minimal native node registering a custom namespaced protocol |
-| [`browser`](./examples/browser) | Browser-to-browser and browser-to-native connectivity over a seed node, without manual SDP exchange |
+| [`frontend`](./examples/frontend) | Browser frontend replacing the historical browser example: wallet login, SDP/HTTP connectivity, topology, dweb workbench, proof workbench, and custom messages |
 | [`relay`](./examples/relay) | TCP & UDP tunnels to a peer's service over the overlay (`tcp.rs` / `udp.rs`) |
 | [`snark`](./examples/snark) | Fold-scheme zkSNARK proving / verification |
 | [`proof-demo`](./examples/proof-demo) | A browser zk-proof app (Yew / Trunk) |
@@ -117,16 +130,13 @@ In the browser a protocol can be a JS handler instead: `provider.on(namespace, i
 handler)`. See [`examples/relay`](./examples/relay) and
 [`crates/node/src/extension`](./crates/node/src/extension).
 
-## Resource
+## Resources
 
-| Resource                         | Link                                                                       | Status                                                                                                                                                                                    |
-|----------------------------------|----------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Rings Whitepaper                 | [Rings Whitepaper](https://github.com/RingsNetwork/whitepaper)             | [![rings-ext-v2](https://github.com/RingsNetwork/rings_ext_v2/actions/workflows/dev.yml/badge.svg)](https://github.com/RingsNetwork/rings_ext_v2/actions/workflows/dev.yml)               |
-| Rings Documentation              | [Rings Docs](https://rings.gitbook.io/)                                    |                                                                                                                                                                                           |
-| Rings Browser Handshakes Example | [Rings Browser Handshakes](https://github.com/RingsNetwork/rings-wasm-p2p) | Demo / PoC                                                                                                                                                                                |
-| Rings Browser Extension          | [Rings Browser Extension](https://github.com/RingsNetwork/rings_ext_v2)    | Beta                                                                                                                                                                                      |
-| Rings dWeb Demo                  | [Rings dWeb Demo](https://github.com/RingsNetwork/rings-dweb)              | [![rings-ext-v2](https://github.com/RingsNetwork/rings_dweb/actions/workflows/nextjs.yml/badge.svg?branch=page)](https://github.com/RingsNetwork/rings_dweb/actions/workflows/nextjs.yml) |
-|Rings zkProof Demo             | [Rings zkProof Demo](https://zkp.rings.rs)  |![rings-snark-demo](https://github.com/RingsNetwork/rings-proof-demo/actions/workflows/nextjs.yml/badge.svg?branch=page)|
+| Resource | Link | Notes |
+|---|---|---|
+| Rings Whitepaper | [PDF](./papers/rings.pdf), [LaTeX source](./papers/rings.tex), [citation](#whitepaper) | Canonical protocol paper |
+| Browser frontend | [`examples/frontend`](./examples/frontend) | Web page and extension workflow |
+| Examples | [`examples/`](./examples) | Native, frontend, dweb, proof, relay, snark, and FFI examples |
 
 ## Components:
 

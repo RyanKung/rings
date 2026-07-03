@@ -8,17 +8,19 @@
   "license": "GPL-3.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/RingsNetwork/rings-node"
+    "url": "https://github.com/RyanKung/rings"
   },
   "scripts": {
     "wasm_pack": "wasm-pack build crates/node --release --scope ringsnetwork -t web --no-default-features --features browser_default --features console_error_panic_hook",
-    "prepare": "npm run wasm_pack && rm -rf dist && mkdir -p dist && cp crates/node/pkg/rings_node* ./dist && cp index.ts ./dist && tsc ./dist/index.ts"
+    "prepare": "npm run wasm_pack && rm -rf dist && mkdir -p dist && cp crates/node/pkg/rings_node* ./dist && cp index.ts ./dist && tsc -p tsconfig.json",
+    "test:frontend-extension-wallet": "node examples/frontend/scripts/test-extension-wallet-bridge.mjs"
   },
   "dependencies": {
     "circomlib": "^2.0.5"
   },
   "devDependencies": {
-    "typescript": "^4.9.5"
+    "playwright": "1.61.1",
+    "typescript": "^5.9.3"
   },
   "files": [
     "dist/"

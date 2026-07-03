@@ -50,7 +50,7 @@ jobs:
 
       - uses: jetli/wasm-bindgen-action@v0.2.0
         with:
-          version: "0.2.100"
+          version: "0.2.121"
 
       # If you need to reset the cache version, increment the number after `v`
       - uses: Swatinem/rust-cache@v2
@@ -66,13 +66,19 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Run browser example core tests
-        run: |
-          node --check examples/browser/app.mjs
-          node --test examples/browser/tests/*.test.mjs
+      - name: Check Rings frontend
+        run: cargo check --target=wasm32-unknown-unknown
+        working-directory: ./examples/frontend
 
-      - name: Run browser example wasm tests
-        run: wasm-pack test --release --node examples/browser
+      - name: Run clippy for Rings frontend
+        run: cargo clippy --target=wasm32-unknown-unknown --all-targets -- -D warnings
+        working-directory: ./examples/frontend
+
+      - name: Run Rings frontend tests
+        uses: coactions/setup-xvfb@v1
+        with:
+          run: cargo test --release --target=wasm32-unknown-unknown
+          working-directory: ./examples/frontend
 
       - name: Run dweb example browser tests
         uses: coactions/setup-xvfb@v1
