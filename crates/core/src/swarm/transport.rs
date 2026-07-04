@@ -42,6 +42,7 @@ use crate::error::Result;
 use crate::measure::order_peers_by_quality;
 use crate::measure::MeasureCounter;
 use crate::measure::MeasureImpl;
+use crate::measure::PeerMeasurement;
 use crate::measure::PeerQuality;
 use crate::message::ConnectNodeReport;
 use crate::message::ConnectNodeSend;
@@ -395,6 +396,14 @@ impl SwarmTransport {
         match &self.measure {
             Some(measure) => measure.quality(peer).await,
             None => PeerQuality::Unknown,
+        }
+    }
+
+    /// Return this node's local measurement counters for `peer`, if observed.
+    pub(crate) async fn peer_measurement(&self, peer: Did) -> Option<PeerMeasurement> {
+        match &self.measure {
+            Some(measure) => PeerMeasurement::from_measure(measure.as_ref(), peer).await,
+            None => None,
         }
     }
 

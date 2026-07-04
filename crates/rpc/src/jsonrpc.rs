@@ -209,9 +209,33 @@ impl Client {
         self.call_method(Method::LookupService, req).await
     }
 
+    /// Looks up signed online-node descriptors.
+    pub async fn lookup_online_nodes(
+        &self,
+        req: &LookupOnlineNodesRequest,
+    ) -> Result<LookupOnlineNodesResponse> {
+        self.call_method(Method::LookupOnlineNodes, req).await
+    }
+
     /// Query for swarm inspect info.
     pub async fn node_info(&self, req: &NodeInfoRequest) -> Result<NodeInfoResponse> {
         self.call_method(Method::NodeInfo, req).await
+    }
+
+    /// Query local measurement counters for a peer.
+    pub async fn peer_measurement(
+        &self,
+        req: &PeerMeasurementRequest,
+    ) -> Result<PeerMeasurementResponse> {
+        self.call_method(Method::PeerMeasurement, req).await
+    }
+
+    /// Query local measurement counters for all connected peers.
+    pub async fn list_peer_measurements(
+        &self,
+        req: &ListPeerMeasurementsRequest,
+    ) -> Result<ListPeerMeasurementsResponse> {
+        self.call_method(Method::ListPeerMeasurements, req).await
     }
 
     pub async fn node_did(&self, req: &NodeDidRequest) -> Result<NodeDidResponse> {

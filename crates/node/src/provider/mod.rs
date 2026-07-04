@@ -5,7 +5,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use rings_core::dht::Did;
 use rings_core::dht::EntryStorage;
+use rings_core::measure::PeerMeasurement;
 use rings_core::session::SessionSkBuilder;
 use rings_core::storage::MemStorage;
 use rings_core::swarm::callback::SharedSwarmCallback;
@@ -105,6 +107,17 @@ impl Provider {
     ) -> Result<()> {
         self.core().send(to, namespace, payload).await
     }
+
+    /// Return local measurement counters for a peer, if observed.
+    pub async fn peer_measurement(&self, did: Did) -> Option<PeerMeasurement> {
+        self.processor.peer_measurement(did).await
+    }
+
+    /// Return observed local measurement counters for all connected peers.
+    pub async fn peer_measurements(&self) -> Vec<PeerMeasurement> {
+        self.processor.peer_measurements().await
+    }
+
     /// Create a provider instance with storage name
     pub(crate) async fn new_provider_with_storage_internal(
         config: ProcessorConfig,
@@ -221,7 +234,9 @@ impl Provider {
         self.request_internal(method.to_string(), params).await
     }
 
-    /// Listen messages
+    /// Listen for messages until this future is dropped or aborted.
+    ///
+    /// This is a long-running task; do not await completion as a readiness signal.
     pub async fn listen(&self) {
         self.processor.listen().await;
     }

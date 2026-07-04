@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::error::Error;
 use crate::error::Result;
+use crate::online::OnlineNodeType;
 use crate::prelude::rings_core::ecc::SecretKey;
 use crate::prelude::SessionSk;
 use crate::processor::ProcessorConfig;
@@ -57,6 +58,14 @@ pub struct Config {
     pub endpoint_url: String,
     pub ice_servers: String,
     pub stabilize_interval: u64,
+    #[serde(default = "crate::registration::default_online_node_heartbeat_interval_secs")]
+    pub online_node_heartbeat_interval_secs: u64,
+    #[serde(default = "crate::registration::default_online_node_ttl_secs")]
+    pub online_node_ttl_secs: u64,
+    #[serde(default = "crate::registration::default_online_node_type")]
+    pub online_node_type: OnlineNodeType,
+    #[serde(default = "crate::registration::default_advertise_presence")]
+    pub advertise_presence: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,7 +104,11 @@ impl TryFrom<Config> for ProcessorConfigSerialized {
             config.ice_servers,
             session_sk,
             config.stabilize_interval,
-        );
+        )
+        .online_node_heartbeat_interval_secs(config.online_node_heartbeat_interval_secs)
+        .online_node_ttl_secs(config.online_node_ttl_secs)
+        .online_node_type(config.online_node_type)
+        .advertise_presence(config.advertise_presence);
 
         cs = if let Some(ext_ip) = config.external_ip {
             cs.external_address(ext_ip)
@@ -137,6 +150,11 @@ impl Config {
             endpoint_url: DEFAULT_ENDPOINT_URL.to_string(),
             ice_servers: DEFAULT_ICE_SERVERS.to_string(),
             stabilize_interval: DEFAULT_STABILIZE_INTERVAL,
+            online_node_heartbeat_interval_secs:
+                crate::registration::default_online_node_heartbeat_interval_secs(),
+            online_node_ttl_secs: crate::registration::default_online_node_ttl_secs(),
+            online_node_type: crate::registration::default_online_node_type(),
+            advertise_presence: crate::registration::default_advertise_presence(),
             external_ip: None,
             webrtc_udp_port_min: None,
             webrtc_udp_port_max: None,
@@ -221,6 +239,7 @@ measure_storage:
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.network_id, 1);
+        assert!(cfg.advertise_presence);
     }
 
     #[test]

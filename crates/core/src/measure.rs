@@ -80,14 +80,48 @@ impl PeerQualityThresholds {
 ///
 /// The counters are local observations only. They do not claim global
 /// reputation and are not signed or replicated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PeerQualityEvidence {
-    connected: u64,
-    disconnected: u64,
-    sent: u64,
-    failed_to_send: u64,
-    received: u64,
-    failed_to_receive: u64,
+    /// Successful connection observations.
+    pub connected: u64,
+    /// Disconnection observations.
+    pub disconnected: u64,
+    /// Successfully sent messages.
+    pub sent: u64,
+    /// Messages that failed before successful send.
+    pub failed_to_send: u64,
+    /// Successfully received and verified messages.
+    pub received: u64,
+    /// Messages that failed decode or verification.
+    pub failed_to_receive: u64,
+}
+
+/// Local measurement counters for one peer.
+///
+/// These counters are local observations only. They are not signed, replicated,
+/// or global reputation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PeerMeasurement {
+    /// Peer DID these counters describe.
+    pub did: Did,
+    /// Local evidence counters for this peer.
+    pub evidence: PeerQualityEvidence,
+}
+
+impl PeerMeasurement {
+    /// Read counters for `did` from a measurement implementation.
+    ///
+    /// Returns `None` when no counter has ever been recorded for `did`; absence
+    /// is distinct from an observed peer with non-zero counters.
+    pub async fn from_measure<M>(measure: &M, did: Did) -> Option<Self>
+    where M: Measure + ?Sized {
+        let evidence = PeerQualityEvidence::from_measure(measure, did).await;
+        if evidence.is_unobserved() {
+            return None;
+        }
+
+        Some(Self { did, evidence })
+    }
 }
 
 impl PeerQualityEvidence {
@@ -123,6 +157,16 @@ impl PeerQualityEvidence {
                 .get_count(did, MeasureCounter::FailedToReceive)
                 .await,
         }
+    }
+
+    /// Return whether this evidence contains no observed counter.
+    pub const fn is_unobserved(self) -> bool {
+        self.connected == 0
+            && self.disconnected == 0
+            && self.sent == 0
+            && self.failed_to_send == 0
+            && self.received == 0
+            && self.failed_to_receive == 0
     }
 
     /// Classify this evidence under the supplied thresholds.

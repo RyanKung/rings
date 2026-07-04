@@ -333,11 +333,51 @@ impl HandleRpc<LookupServiceRequest, LookupServiceResponse> for Processor {
 
 #[cfg_attr(feature = "browser", async_trait(?Send))]
 #[cfg_attr(not(feature = "browser"), async_trait)]
+impl HandleRpc<LookupOnlineNodesRequest, LookupOnlineNodesResponse> for Processor {
+    async fn handle_rpc(&self, req: LookupOnlineNodesRequest) -> Result<LookupOnlineNodesResponse> {
+        let nodes = self
+            .lookup_online_nodes(req.include_expired)
+            .await
+            .map_err(Error::from)?;
+        Ok(LookupOnlineNodesResponse {
+            nodes: crate::rpc_dto::online_node_descriptor_infos(nodes)?,
+        })
+    }
+}
+
+#[cfg_attr(feature = "browser", async_trait(?Send))]
+#[cfg_attr(not(feature = "browser"), async_trait)]
 impl HandleRpc<NodeInfoRequest, NodeInfoResponse> for Processor {
     async fn handle_rpc(&self, _req: NodeInfoRequest) -> Result<NodeInfoResponse> {
         self.get_node_info()
             .await
             .map_err(|_| Error::new(ErrorCode::InternalError))
+    }
+}
+
+#[cfg_attr(feature = "browser", async_trait(?Send))]
+#[cfg_attr(not(feature = "browser"), async_trait)]
+impl HandleRpc<PeerMeasurementRequest, PeerMeasurementResponse> for Processor {
+    async fn handle_rpc(&self, req: PeerMeasurementRequest) -> Result<PeerMeasurementResponse> {
+        let did = s2d(&req.did)?;
+        Ok(PeerMeasurementResponse {
+            measurement: crate::rpc_dto::optional_peer_measurement_info(
+                self.peer_measurement(did).await,
+            )?,
+        })
+    }
+}
+
+#[cfg_attr(feature = "browser", async_trait(?Send))]
+#[cfg_attr(not(feature = "browser"), async_trait)]
+impl HandleRpc<ListPeerMeasurementsRequest, ListPeerMeasurementsResponse> for Processor {
+    async fn handle_rpc(
+        &self,
+        _req: ListPeerMeasurementsRequest,
+    ) -> Result<ListPeerMeasurementsResponse> {
+        Ok(ListPeerMeasurementsResponse {
+            measurements: crate::rpc_dto::peer_measurement_infos(self.peer_measurements().await)?,
+        })
     }
 }
 

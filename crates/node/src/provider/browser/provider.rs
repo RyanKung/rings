@@ -224,7 +224,10 @@ impl Provider {
         })
     }
 
-    /// listen message.
+    /// Start the long-running listener.
+    ///
+    /// The returned Promise is not a readiness barrier and does not resolve
+    /// during normal operation.
     pub fn listen(&self) -> js_sys::Promise {
         let p = self.processor.clone();
 
@@ -272,6 +275,23 @@ impl Provider {
         future_to_promise(async move {
             let info = p.get_node_info().await.map_err(JsError::from)?;
             let v = js_value::serialize(&info).map_err(JsError::from)?;
+            Ok(v)
+        })
+    }
+
+    /// Get local measurement counters for a peer.
+    pub fn get_peer_measurement(
+        &self,
+        address: String,
+        addr_type: Option<AddressType>,
+    ) -> js_sys::Promise {
+        let p = self.processor.clone();
+        future_to_promise(async move {
+            let did = get_did(address.as_str(), addr_type.unwrap_or(AddressType::DEFAULT))?;
+            let measurement = p.peer_measurement(did).await;
+            let measurement = crate::rpc_dto::optional_peer_measurement_info(measurement)
+                .map_err(JsError::from)?;
+            let v = js_value::serialize(&measurement).map_err(JsError::from)?;
             Ok(v)
         })
     }

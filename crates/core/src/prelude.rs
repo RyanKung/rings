@@ -9,8 +9,10 @@ pub use url;
 pub use uuid;
 
 pub use crate::dht::entry;
+pub use crate::measure::PeerMeasurement;
 pub use crate::message;
 pub use crate::message::ChordStorageInterface;
 pub use crate::message::ChordStorageInterfaceCacheChecker;
 pub use crate::message::MessageRelay;
+pub use crate::message::ReportReturnPolicy;
 pub use crate::message::SubringInterface;

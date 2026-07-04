@@ -6,6 +6,7 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 
 use crate::dht::entry::Entry;
+use crate::dht::entry::PlacedEntryOperation;
 use crate::dht::entry::SyncedEntryAck;
 use crate::dht::Chord;
 use crate::dht::ChordStorage;
@@ -45,6 +46,8 @@ pub trait ChordStorageInterface<const REDUNDANT: u16> {
     async fn storage_append_data(&self, topic: &str, data: Encoded) -> Result<()>;
     /// Append data to a Data kind entry uniquely.
     async fn storage_touch_data(&self, topic: &str, data: Encoded) -> Result<()>;
+    /// Tombstone observed data in a Data kind entry.
+    async fn storage_tombstone_data(&self, topic: &str, data: Encoded) -> Result<()>;
 }
 
 /// ChordStorageInterfaceCacheChecker defines the interface for checking the local cache of the DHT.
@@ -61,13 +64,6 @@ fn finish_storage_action(act: PeerRingAction) -> Result<()> {
     match act {
         PeerRingAction::None => Ok(()),
         act => Err(Error::unexpected_peer_ring_action(act)),
-    }
-}
-
-fn finish_storage_action_ref(act: &PeerRingAction) -> Result<()> {
-    match act {
-        PeerRingAction::None => Ok(()),
-        act => Err(Error::unexpected_peer_ring_action(act.clone())),
     }
 }
 
@@ -167,6 +163,39 @@ pub(super) async fn handle_storage_store_act(
     Ok(())
 }
 
+async fn operate_entry_at_placement(
+    dht: &PeerRing,
+    placement: Did,
+    op: EntryOperation,
+) -> Result<()> {
+    let op = op.stamped(dht.did)?;
+    let this = match dht.storage.get(&placement.to_string()).await? {
+        Some(this) => this,
+        None => op.clone().gen_default_entry()?,
+    };
+    let entry = this.operate(op, dht.did)?;
+    dht.join_storage_entry(placement, entry).await?;
+    Ok(())
+}
+
+async fn handle_placed_entry_operation(
+    handler: &MessageHandler,
+    ctx: &MessagePayload,
+    msg: &PlacedEntryOperation,
+) -> Result<()> {
+    msg.validate_placement(handler.transport.storage_redundancy())?;
+
+    match handler.dht.find_successor(msg.placement)? {
+        PeerRingAction::Some(_) => {
+            operate_entry_at_placement(&handler.dht, msg.placement, msg.op.clone()).await
+        }
+        PeerRingAction::RemoteAction(next, PeerRingRemoteAction::FindSuccessor(_)) => {
+            reset_storage_relay_destination(handler, ctx, next).await
+        }
+        action => Err(Error::unexpected_peer_ring_action(action)),
+    }
+}
+
 /// Execute copy-only storage repair actions.
 #[cfg_attr(feature = "wasm", async_recursion(?Send))]
 #[cfg_attr(not(feature = "wasm"), async_recursion)]
@@ -252,35 +281,6 @@ async fn handle_storage_search_act(
             Ok(())
         }
         act => finish_storage_action(act),
-    }
-}
-
-/// Execute storage operation actions emitted by inbound message handlers.
-#[cfg_attr(feature = "wasm", async_recursion(?Send))]
-#[cfg_attr(not(feature = "wasm"), async_recursion)]
-async fn handle_storage_operate_act(
-    handler: &MessageHandler,
-    ctx: &MessagePayload,
-    act: &PeerRingAction,
-) -> Result<()> {
-    match act {
-        PeerRingAction::RemoteAction(next, _) => {
-            reset_storage_relay_destination(handler, ctx, *next).await
-        }
-        PeerRingAction::MultiActions(acts) => {
-            let jobs = acts
-                .iter()
-                .map(|act| async move { handle_storage_operate_act(handler, ctx, act).await });
-
-            for res in futures::future::join_all(jobs).await {
-                if res.is_err() {
-                    tracing::error!("Failed on handle multi actions: {:#?}", res)
-                }
-            }
-
-            Ok(())
-        }
-        act => finish_storage_action_ref(act),
     }
 }
 
@@ -382,6 +382,15 @@ impl<const REDUNDANT: u16> ChordStorageInterface<REDUNDANT> for Swarm {
         handle_storage_store_act(self.transport.clone(), act).await?;
         Ok(())
     }
+
+    async fn storage_tombstone_data(&self, topic: &str, data: Encoded) -> Result<()> {
+        self.transport.ensure_storage_redundancy::<REDUNDANT>()?;
+        let entry: Entry = (topic.to_string(), data).try_into()?;
+        let op = EntryOperation::Tombstone(entry);
+        let act = <PeerRing as ChordStorage<_, REDUNDANT>>::entry_operate(&self.dht, op).await?;
+        handle_storage_store_act(self.transport.clone(), act).await?;
+        Ok(())
+    }
 }
 
 #[cfg_attr(feature = "wasm", async_trait(?Send))]
@@ -431,12 +440,9 @@ impl HandleMsg<FoundEntry> for MessageHandler {
 
 #[cfg_attr(feature = "wasm", async_trait(?Send))]
 #[cfg_attr(not(feature = "wasm"), async_trait)]
-impl HandleMsg<EntryOperation> for MessageHandler {
-    async fn handle(&self, ctx: &MessagePayload, msg: &EntryOperation) -> Result<()> {
-        // For relay message, set redundant to 1
-        let action =
-            <PeerRing as ChordStorage<_, 1>>::entry_operate(&self.dht, msg.clone()).await?;
-        handle_storage_operate_act(self, ctx, &action).await
+impl HandleMsg<PlacedEntryOperation> for MessageHandler {
+    async fn handle(&self, ctx: &MessagePayload, msg: &PlacedEntryOperation) -> Result<()> {
+        handle_placed_entry_operation(self, ctx, msg).await
     }
 }
 
@@ -513,6 +519,78 @@ mod test {
             .ok_or_else(|| Error::InvalidMessage("expected generated key".to_string()))
     }
 
+    fn prepare_node_with_storage_redundancy(key: SecretKey, redundancy: u16) -> Result<Node> {
+        let session_sk = SessionSk::new_with_seckey(&key)?;
+        let swarm = Arc::new(
+            SwarmBuilder::new(
+                0,
+                "stun://stun.l.google.com:19302",
+                Box::new(MemStorage::new()),
+                session_sk,
+            )
+            .dht_storage_redundancy(redundancy)
+            .dht_finger_table_size(8)
+            .build(),
+        );
+        Ok(Node::new(swarm))
+    }
+
+    fn owner_index(nodes: &[&Node], placement: Did) -> Result<usize> {
+        let mut owner = None;
+        for (index, node) in nodes.iter().enumerate() {
+            if !matches!(
+                node.dht().find_successor(placement)?,
+                PeerRingAction::Some(_)
+            ) {
+                continue;
+            }
+
+            if owner.replace(index).is_some() {
+                return Err(Error::InvalidMessage(
+                    "placement has more than one observed owner".to_string(),
+                ));
+            }
+        }
+        owner.ok_or_else(|| Error::InvalidMessage("placement has no observed owner".to_string()))
+    }
+
+    fn split_redundant_entry(nodes: &[&Node]) -> Result<(Entry, Did, Did, usize, usize)> {
+        for attempt in 0..512 {
+            let topic = format!("split remote replica placement {attempt}");
+            let entry: Entry = topic.try_into()?;
+            let mut placements = entry.did.rotate_affine(2)?.into_iter();
+            let primary = placements
+                .next()
+                .ok_or_else(|| Error::InvalidMessage("expected primary placement".to_string()))?;
+            let replica = placements
+                .next()
+                .ok_or_else(|| Error::InvalidMessage("expected replica placement".to_string()))?;
+            let primary_owner = owner_index(nodes, primary)?;
+            let replica_owner = owner_index(nodes, replica)?;
+            if primary_owner != replica_owner {
+                return Ok((entry, primary, replica, primary_owner, replica_owner));
+            }
+        }
+
+        Err(Error::InvalidMessage(
+            "could not sample a split-owner redundant entry".to_string(),
+        ))
+    }
+
+    fn non_affine_placement(entry_key: Did, redundancy: u16) -> Result<Did> {
+        let placements = entry_key.rotate_affine(redundancy)?;
+        for attempt in 0..512 {
+            let candidate = Entry::gen_did(&format!("non-affine placement {attempt}"))?;
+            if !placements.contains(&candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        Err(Error::InvalidMessage(
+            "could not sample non-affine placement".to_string(),
+        ))
+    }
+
     async fn assert_cached_data_values(
         node: &Node,
         entry_key: Did,
@@ -538,7 +616,6 @@ mod test {
     #[test]
     fn finish_storage_action_accepts_empty_action() -> Result<()> {
         finish_storage_action(PeerRingAction::None)?;
-        finish_storage_action_ref(&PeerRingAction::None)?;
         Ok(())
     }
 
@@ -744,6 +821,100 @@ mod test {
                 requested: 2
             })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn placed_entry_operation_rejects_non_affine_placement() -> Result<()> {
+        let node = prepare_node_with_storage_redundancy(SecretKey::random(), 2)?;
+        let handler = MessageHandler::new(node.swarm.transport.clone(), Arc::new(NoopCallback));
+        let topic = "reject misplaced remote storage operation".to_string();
+        let entry: Entry = topic.try_into()?;
+        let invalid_placement = non_affine_placement(entry.did, 2)?;
+        let msg = PlacedEntryOperation {
+            placement: invalid_placement,
+            op: EntryOperation::Overwrite(entry.clone()),
+        };
+        let sender_session = SessionSk::new_with_seckey(&SecretKey::random())?;
+        let context = MessagePayload::new_send(
+            Message::OperateEntry(msg.clone()),
+            &sender_session,
+            node.did(),
+            node.did(),
+        )?;
+
+        assert!(!msg.placement_belongs_to_entry(2)?);
+        let result = handler.handle(&context, &msg).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidMessage(message)) if message.contains("affine replica set")
+        ));
+        assert_eq!(
+            node.dht()
+                .storage
+                .get(&invalid_placement.to_string())
+                .await?,
+            None
+        );
+        assert_eq!(node.dht().storage.get(&entry.did.to_string()).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_redundant_store_writes_split_replica_at_affine_placement() -> Result<()> {
+        let mut keys = gen_ordered_keys(2).into_iter();
+        let node1 = prepare_node_with_storage_redundancy(next_generated_key(&mut keys)?, 2)?;
+        let node2 = prepare_node_with_storage_redundancy(next_generated_key(&mut keys)?, 2)?;
+
+        manually_establish_connection(&node1.swarm, &node2.swarm).await;
+        wait_for_msgs([&node1, &node2]).await;
+        assert_no_more_msg([&node1, &node2]).await;
+
+        let nodes = [&node1, &node2];
+        let (entry, primary, replica, primary_owner, replica_owner) =
+            split_redundant_entry(&nodes)?;
+        assert_eq!(primary, entry.did);
+        let writer = nodes[primary_owner];
+        let remote_replica_owner = nodes[replica_owner];
+
+        <Swarm as ChordStorageInterface<2>>::storage_store(&writer.swarm, entry.clone()).await?;
+
+        let payload = next_payload(remote_replica_owner).await?;
+        assert!(matches!(
+            payload.transaction.data()?,
+            Message::OperateEntry(PlacedEntryOperation {
+                placement,
+                op: EntryOperation::Overwrite(remote_entry),
+            }) if placement == replica && remote_entry.did == entry.did
+        ));
+        assert_eq!(
+            writer
+                .dht()
+                .storage
+                .get(&primary.to_string())
+                .await?
+                .map(|stored| stored.did),
+            Some(entry.did)
+        );
+        assert_eq!(
+            remote_replica_owner
+                .dht()
+                .storage
+                .get(&replica.to_string())
+                .await?
+                .map(|stored| stored.did),
+            Some(entry.did)
+        );
+        assert_eq!(
+            remote_replica_owner
+                .dht()
+                .storage
+                .get(&primary.to_string())
+                .await?,
+            None
+        );
+        assert_no_more_msg([&node1, &node2]).await;
         Ok(())
     }
 
@@ -1095,7 +1266,10 @@ mod test {
         let ev = next_payload(&node2).await?;
         assert!(matches!(
             ev.transaction.data()?,
-            Message::OperateEntry(EntryOperation::Overwrite(x)) if x.did == entry_key
+            Message::OperateEntry(PlacedEntryOperation {
+                placement,
+                op: EntryOperation::Overwrite(x),
+            }) if placement == entry_key && x.did == entry_key
         ));
 
         assert!(node1.swarm.storage_check_cache(entry_key).await.is_none());
@@ -1254,6 +1428,57 @@ mod test {
         assert_no_more_msg([&node1, &node2]).await;
 
         assert_cached_data_values(&node1, entry_key, &["111", "333", "222"]).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn storage_tombstone_data_removes_observed_payload() -> Result<()> {
+        let mut keys = gen_ordered_keys(2).into_iter();
+        let key1 = next_generated_key(&mut keys)?;
+        let key2 = next_generated_key(&mut keys)?;
+        let node1 = prepare_node(key1).await;
+        let node2 = prepare_node(key2).await;
+
+        manually_establish_connection(&node1.swarm, &node2.swarm).await;
+        wait_for_msgs([&node1, &node2]).await;
+        assert_no_more_msg([&node1, &node2]).await;
+
+        let topic = "tombstone removes stale data topic payloads".to_string();
+        let entry: Entry = topic.clone().try_into()?;
+        let entry_key = entry.did;
+
+        let (node1, node2) = if entry_key.in_range(node2.did(), node2.did(), node1.did()) {
+            (node1, node2)
+        } else {
+            (node2, node1)
+        };
+
+        for value in ["111", "222"] {
+            <Swarm as ChordStorageInterface<1>>::storage_touch_data(
+                &node1.swarm,
+                &topic,
+                value.to_string().encode()?,
+            )
+            .await?;
+            wait_for_msgs([&node1, &node2]).await;
+            assert_no_more_msg([&node1, &node2]).await;
+        }
+
+        <Swarm as ChordStorageInterface<1>>::storage_tombstone_data(
+            &node1.swarm,
+            &topic,
+            "111".to_string().encode()?,
+        )
+        .await?;
+        wait_for_msgs([&node1, &node2]).await;
+        assert_no_more_msg([&node1, &node2]).await;
+
+        <Swarm as ChordStorageInterface<1>>::storage_fetch(&node1.swarm, entry_key).await?;
+        wait_for_msgs([&node1, &node2]).await;
+        assert_no_more_msg([&node1, &node2]).await;
+
+        assert_cached_data_values(&node1, entry_key, &["222"]).await?;
 
         Ok(())
     }
