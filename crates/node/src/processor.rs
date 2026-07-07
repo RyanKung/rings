@@ -10,7 +10,9 @@ use futures::future::join_all;
 use rings_core::chunk::ReassemblyLimits;
 use rings_core::dht::Did;
 use rings_core::dht::EntryStorage;
+use rings_core::dht::VirtualNodeConfig;
 use rings_core::dht::DEFAULT_FINGER_TABLE_SIZE;
+use rings_core::dht::MAX_STORAGE_VIRTUAL_POSITIONS_PER_OWNER;
 use rings_core::ecc::PublicKey;
 use rings_core::ecc::SecretKey;
 use rings_core::measure::MeasureImpl;
@@ -83,6 +85,8 @@ pub struct ProcessorConfig {
     online_node_type: OnlineNodeType,
     /// Whether listen() advertises this node's presence.
     advertise_presence: bool,
+    /// Storage-only virtual positions derived per physical peer.
+    dht_virtual_nodes: u16,
 }
 
 #[wasm_export]
@@ -108,6 +112,7 @@ impl ProcessorConfig {
             online_node_ttl: Duration::from_secs(default_online_node_ttl_secs()),
             online_node_type: default_online_node_type(),
             advertise_presence: default_advertise_presence(),
+            dht_virtual_nodes: 0,
         }
     }
 
@@ -164,6 +169,8 @@ pub struct ProcessorConfigSerialized {
     /// Whether listen() advertises this node's presence.
     #[serde(default = "default_advertise_presence")]
     advertise_presence: bool,
+    /// Storage-only virtual positions derived per physical peer.
+    dht_virtual_nodes: u16,
 }
 
 impl ProcessorConfigSerialized {
@@ -186,6 +193,7 @@ impl ProcessorConfigSerialized {
             online_node_ttl_secs: default_online_node_ttl_secs(),
             online_node_type: default_online_node_type(),
             advertise_presence: default_advertise_presence(),
+            dht_virtual_nodes: 0,
         }
     }
 
@@ -226,6 +234,17 @@ impl ProcessorConfigSerialized {
         self.advertise_presence = advertise;
         self
     }
+
+    /// Sets storage-only virtual positions derived per physical peer.
+    ///
+    /// Serialized configs reject values above
+    /// [`MAX_STORAGE_VIRTUAL_POSITIONS_PER_OWNER`]. This setter is infallible
+    /// for direct programmatic use; the core swarm builder normalizes the value
+    /// once before storage ownership and protocol advertisement are created.
+    pub fn dht_virtual_nodes(mut self, positions_per_peer: u16) -> Self {
+        self.dht_virtual_nodes = positions_per_peer;
+        self
+    }
 }
 
 pub(crate) fn parse_webrtc_udp_port_range(
@@ -239,6 +258,16 @@ pub(crate) fn parse_webrtc_udp_port_range(
             .map_err(Error::from),
         (min, max) => Err(Error::IncompleteWebrtcUdpPortRange { min, max }),
     }
+}
+
+fn validate_dht_virtual_nodes(positions_per_peer: u16) -> Result<()> {
+    if VirtualNodeConfig::positions_per_owner_within_limit(positions_per_peer) {
+        return Ok(());
+    }
+
+    Err(Error::InvalidConfig(format!(
+        "dht_virtual_nodes {positions_per_peer} exceeds maximum {MAX_STORAGE_VIRTUAL_POSITIONS_PER_OWNER}"
+    )))
 }
 
 impl TryFrom<ProcessorConfig> for ProcessorConfigSerialized {
@@ -256,6 +285,7 @@ impl TryFrom<ProcessorConfig> for ProcessorConfigSerialized {
             online_node_ttl_secs: ins.online_node_ttl.as_secs(),
             online_node_type: ins.online_node_type,
             advertise_presence: ins.advertise_presence,
+            dht_virtual_nodes: ins.dht_virtual_nodes,
         })
     }
 }
@@ -265,6 +295,7 @@ impl TryFrom<ProcessorConfigSerialized> for ProcessorConfig {
     fn try_from(ins: ProcessorConfigSerialized) -> Result<Self> {
         let webrtc_udp_port_range =
             parse_webrtc_udp_port_range(ins.webrtc_udp_port_min, ins.webrtc_udp_port_max)?;
+        validate_dht_virtual_nodes(ins.dht_virtual_nodes)?;
         let online_node_heartbeat_interval =
             Duration::from_secs(ins.online_node_heartbeat_interval_secs);
         let online_node_ttl = Duration::from_secs(ins.online_node_ttl_secs);
@@ -285,6 +316,7 @@ impl TryFrom<ProcessorConfigSerialized> for ProcessorConfig {
             online_node_ttl,
             online_node_type: ins.online_node_type,
             advertise_presence: ins.advertise_presence,
+            dht_virtual_nodes: ins.dht_virtual_nodes,
         })
     }
 }
@@ -333,6 +365,7 @@ pub struct ProcessorBuilder {
     advertise_presence: bool,
     registration_tasks: Vec<Arc<dyn RegistrationTask>>,
     dht_finger_table_size: usize,
+    dht_virtual_nodes: u16,
     reassembly_limits: ReassemblyLimits,
 }
 
@@ -381,6 +414,7 @@ impl ProcessorBuilder {
             advertise_presence: config.advertise_presence,
             registration_tasks: Vec::new(),
             dht_finger_table_size: DEFAULT_FINGER_TABLE_SIZE,
+            dht_virtual_nodes: config.dht_virtual_nodes,
             reassembly_limits: ReassemblyLimits::production(),
         })
     }
@@ -400,6 +434,18 @@ impl ProcessorBuilder {
     /// Set the number of DHT finger-table slots for the processor's swarm.
     pub fn dht_finger_table_size(mut self, size: usize) -> Self {
         self.dht_finger_table_size = size;
+        self
+    }
+
+    /// Set storage-only virtual positions derived per physical peer.
+    ///
+    /// Serialized configs reject values above
+    /// [`MAX_STORAGE_VIRTUAL_POSITIONS_PER_OWNER`]. This builder setter is
+    /// infallible for direct programmatic use; the core swarm builder
+    /// normalizes the value once before storage ownership and protocol
+    /// advertisement are created.
+    pub fn dht_virtual_nodes(mut self, positions_per_peer: u16) -> Self {
+        self.dht_virtual_nodes = positions_per_peer;
         self
     }
 
@@ -461,6 +507,7 @@ impl ProcessorBuilder {
             SwarmBuilder::new(self.network_id, &self.ice_servers, storage, self.session_sk);
         swarm_builder = swarm_builder.dht_storage_redundancy(DATA_REDUNDANT);
         swarm_builder = swarm_builder.dht_finger_table_size(self.dht_finger_table_size);
+        swarm_builder = swarm_builder.dht_virtual_nodes(self.dht_virtual_nodes);
         swarm_builder = swarm_builder.reassembly_limits(self.reassembly_limits);
 
         if let Some(external_address) = self.external_address {
@@ -544,7 +591,7 @@ impl Processor {
 
         let descriptors = Self::online_node_descriptors_from_entry(&entry)
             .into_iter()
-            .filter(|descriptor| descriptor.matches_network(self.swarm.network_id()));
+            .filter(|descriptor| descriptor.matches_dht_protocol(self.swarm.dht_protocol_mode()));
 
         Ok(OnlineNodeDescriptor::latest_valid_by_did(
             descriptors,
@@ -1006,6 +1053,55 @@ mod test {
         assert!(builder.advertise_presence);
     }
 
+    #[test]
+    fn dht_virtual_nodes_rejects_values_above_cost_bound() {
+        let key = SecretKey::random();
+        let session_sk = SessionSk::new_with_seckey(&key).unwrap();
+        let serialized = ProcessorConfigSerialized::new(
+            0,
+            "stun://stun.l.google.com:19302".to_string(),
+            session_sk.dump().unwrap(),
+            3,
+        )
+        .dht_virtual_nodes(MAX_STORAGE_VIRTUAL_POSITIONS_PER_OWNER.saturating_add(1));
+
+        assert!(matches!(
+            ProcessorConfig::try_from(serialized),
+            Err(Error::InvalidConfig(message))
+                if message.contains("dht_virtual_nodes")
+                    && message.contains(&MAX_STORAGE_VIRTUAL_POSITIONS_PER_OWNER.to_string())
+        ));
+    }
+
+    #[test]
+    fn serialized_processor_config_requires_dht_virtual_nodes() {
+        let key = SecretKey::random();
+        let session_sk = SessionSk::new_with_seckey(&key).unwrap();
+        let yaml = format!(
+            r#"
+network_id: 0
+ice_servers: stun://stun.l.google.com:19302
+external_address: null
+webrtc_udp_port_min: null
+webrtc_udp_port_max: null
+session_sk: "{}"
+stabilize_interval: 3
+online_node_heartbeat_interval_secs: 30
+online_node_ttl_secs: 60
+online_node_type: Native
+advertise_presence: true
+"#,
+            session_sk.dump().unwrap()
+        );
+
+        let result = serde_yaml::from_str::<ProcessorConfigSerialized>(&yaml);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.to_string().contains("dht_virtual_nodes")
+        ));
+    }
+
     #[tokio::test]
     async fn custom_registration_task_publishes_through_shared_dht_sink() -> Result<()> {
         let topic = "custom_registration_task";
@@ -1060,6 +1156,14 @@ mod test {
         assert_eq!(nodes[0].did, processor.did());
         assert_eq!(nodes[0].did, published.did);
         assert_eq!(nodes[0].network_id, processor.swarm.network_id());
+        assert_eq!(
+            nodes[0].storage_redundancy,
+            processor.swarm.storage_redundancy()
+        );
+        assert_eq!(
+            nodes[0].dht_virtual_nodes,
+            processor.swarm.dht_virtual_nodes()
+        );
         assert!(nodes[0].verify_signature());
         assert!(!nodes[0].is_expired_at(get_epoch_ms()));
         Ok(())
@@ -1131,6 +1235,8 @@ mod test {
                     .map_err(Error::CoreError)?,
                 node_type: default_online_node_type(),
                 network_id: expired_processor.swarm.network_id(),
+                storage_redundancy: expired_processor.swarm.storage_redundancy(),
+                dht_virtual_nodes: expired_processor.swarm.dht_virtual_nodes(),
                 capabilities: OnlineNodeRegistration::capabilities(),
                 endpoint_hint: None,
                 started_at_ms: now_ms.saturating_sub(120_000),
@@ -1171,6 +1277,68 @@ mod test {
         let now_ms = get_epoch_ms();
         let local_descriptor = processor.online_node_descriptor_at(now_ms)?;
         let foreign_descriptor = foreign.online_node_descriptor_at(now_ms)?;
+
+        processor
+            .storage_store(Processor::online_node_registry_entry(vec![
+                local_descriptor.clone(),
+                foreign_descriptor,
+            ])?)
+            .await?;
+
+        let nodes = processor.lookup_online_nodes(true).await?;
+        assert_eq!(nodes, vec![local_descriptor]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn online_node_lookup_filters_other_dht_virtual_node_modes() -> Result<()> {
+        let processor = prepare_processor_with_network_and_virtual_nodes(0, 2).await;
+        let foreign = prepare_processor_with_network_and_virtual_nodes(0, 3).await;
+        let now_ms = get_epoch_ms();
+        let local_descriptor = processor.online_node_descriptor_at(now_ms)?;
+        let foreign_descriptor = foreign.online_node_descriptor_at(now_ms)?;
+
+        processor
+            .storage_store(Processor::online_node_registry_entry(vec![
+                local_descriptor.clone(),
+                foreign_descriptor,
+            ])?)
+            .await?;
+
+        let nodes = processor.lookup_online_nodes(true).await?;
+        assert_eq!(nodes, vec![local_descriptor]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn online_node_lookup_filters_other_storage_redundancy_modes() -> Result<()> {
+        let processor = prepare_processor_with_network(0).await;
+        let foreign = prepare_processor_with_network(0).await;
+        let now_ms = get_epoch_ms();
+        let local_descriptor = processor.online_node_descriptor_at(now_ms)?;
+        let foreign_descriptor = OnlineNodeDescriptor::new_signed(
+            OnlineNodeDescriptorBody {
+                did: foreign.did(),
+                public_key: foreign
+                    .swarm
+                    .account_verification_pubkey()
+                    .map_err(Error::CoreError)?,
+                node_type: default_online_node_type(),
+                network_id: foreign.swarm.network_id(),
+                storage_redundancy: mismatched_storage_redundancy(
+                    foreign.swarm.storage_redundancy(),
+                ),
+                dht_virtual_nodes: foreign.swarm.dht_virtual_nodes(),
+                capabilities: OnlineNodeRegistration::capabilities(),
+                endpoint_hint: None,
+                started_at_ms: now_ms,
+                heartbeat_at_ms: now_ms,
+                expires_at_ms: now_ms.saturating_add(60_000),
+                version: crate::util::build_version(),
+            },
+            &foreign.session_sk,
+        )
+        .map_err(Error::CoreError)?;
 
         processor
             .storage_store(Processor::online_node_registry_entry(vec![
@@ -1274,6 +1442,50 @@ mod test {
         let conn_dids = processor.swarm.peers();
         assert_eq!(conn_dids.len(), 1);
         assert_eq!(conn_dids.first().unwrap().did, peer_did.to_string());
+    }
+
+    #[tokio::test]
+    async fn answer_offer_rejects_dht_virtual_node_mismatch() {
+        let _network_guard = network_test_guard().await;
+        let offerer = prepare_processor_with_network_and_virtual_nodes(0, 2).await;
+        let answerer = prepare_processor_with_network_and_virtual_nodes(0, 3).await;
+        let offer = offerer.swarm.create_offer(answerer.did()).await.unwrap();
+
+        let result = answerer.swarm.answer_offer(offer).await;
+
+        assert!(matches!(
+            result,
+            Err(rings_core::error::Error::InvalidMessage(message))
+                if message.contains("DHT protocol mismatch")
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_answer_rejects_dht_virtual_node_mismatch() {
+        let _network_guard = network_test_guard().await;
+        let offerer = prepare_processor_with_network_and_virtual_nodes(0, 2).await;
+        let answerer = prepare_processor_with_network_and_virtual_nodes(0, 2).await;
+        let offer = offerer.swarm.create_offer(answerer.did()).await.unwrap();
+        let answer = answerer.swarm.answer_offer(offer).await.unwrap();
+        let Message::ConnectNodeReport(mut report) = answer.transaction.data().unwrap() else {
+            panic!("expected ConnectNodeReport");
+        };
+        report.dht_virtual_nodes = 3;
+        let mismatched_answer = MessagePayload::new_send(
+            Message::ConnectNodeReport(report),
+            &answerer.session_sk,
+            answerer.did(),
+            answerer.did(),
+        )
+        .unwrap();
+
+        let result = offerer.swarm.accept_answer(mismatched_answer).await;
+
+        assert!(matches!(
+            result,
+            Err(rings_core::error::Error::InvalidMessage(message))
+                if message.contains("answer DHT protocol mismatch")
+        ));
     }
 
     struct SwarmCallbackInstance {
@@ -1423,14 +1635,23 @@ mod test {
     }
 
     async fn prepare_processor_with_network(network_id: u32) -> Processor {
+        prepare_processor_with_network_and_virtual_nodes(network_id, 0).await
+    }
+
+    async fn prepare_processor_with_network_and_virtual_nodes(
+        network_id: u32,
+        dht_virtual_nodes: u16,
+    ) -> Processor {
         let key = SecretKey::random();
         let session_sk = SessionSk::new_with_seckey(&key).unwrap();
-        let config = ProcessorConfig::new(
+        let serialized = ProcessorConfigSerialized::new(
             network_id,
             "stun://stun.l.google.com:19302".to_string(),
-            session_sk,
+            session_sk.dump().unwrap(),
             3,
-        );
+        )
+        .dht_virtual_nodes(dht_virtual_nodes);
+        let config = ProcessorConfig::try_from(serialized).unwrap();
         let storage = Box::new(MemStorage::new());
 
         ProcessorBuilder::from_config(&config)
@@ -1439,6 +1660,14 @@ mod test {
             .dht_finger_table_size(8)
             .build()
             .unwrap()
+    }
+
+    fn mismatched_storage_redundancy(value: u16) -> u16 {
+        if value == u16::MAX {
+            value.saturating_sub(1)
+        } else {
+            value.saturating_add(1)
+        }
     }
 
     fn owns_entry_placement(processor: &Processor, placement_key: Did) -> Result<bool> {
