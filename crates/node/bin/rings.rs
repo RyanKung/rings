@@ -1,7 +1,10 @@
+use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use clap::ArgAction;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
@@ -16,6 +19,14 @@ use rings_node::native::cli::Client;
 use rings_node::native::config;
 use rings_node::native::endpoint::run_external_api;
 use rings_node::native::endpoint::run_internal_api;
+use rings_node::onion::proxy::http::run_onion_http_proxy;
+use rings_node::onion::proxy::http::OnionHttpProxyOptions;
+use rings_node::onion::tcp::NativeOnionCircuitHandle;
+use rings_node::onion::tcp::NativeOnionTcpExitConfig;
+use rings_node::onion::OnionExitService;
+use rings_node::onion::OnionExitTarget;
+use rings_node::onion::OnionExitTransport;
+use rings_node::onion::OnionServiceName;
 use rings_node::prelude::rings_core::chunk::ReassemblyLimits;
 use rings_node::prelude::rings_core::dht::Did;
 use rings_node::prelude::rings_core::ecc::SecretKey;
@@ -82,6 +93,46 @@ impl ReassemblyProfile {
     }
 }
 
+fn parse_onion_exit_service(raw: &str) -> Result<OnionExitService, String> {
+    let (name, transport) = raw
+        .split_once(':')
+        .map_or((raw, raw), |(name, transport)| (name, transport));
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("onion exit service name must not be empty".to_string());
+    }
+    let transport = match transport.trim().to_ascii_lowercase().as_str() {
+        "tcp" => OnionExitTransport::Tcp,
+        "udp" => OnionExitTransport::Udp,
+        "webtransport" | "web-transport" => OnionExitTransport::WebTransport,
+        "requestresponse" | "request-response" => OnionExitTransport::RequestResponse,
+        "https" => OnionExitTransport::Https,
+        other => {
+            return Err(format!(
+                "unsupported onion exit transport {other:?}; expected tcp, udp, webtransport, request-response, or https"
+            ));
+        }
+    };
+    OnionExitService::new(name, transport).map_err(|error| error.to_string())
+}
+
+fn parse_onion_service_name(raw: &str) -> Result<OnionServiceName, String> {
+    OnionServiceName::parse(raw).map_err(|error| error.to_string())
+}
+
+fn validate_native_onion_exit_services(services: &[OnionExitService]) -> anyhow::Result<()> {
+    for service in services {
+        if service.transport != OnionExitTransport::Tcp {
+            anyhow::bail!(
+                "native onion exits can serve only TCP transport; service {:?} uses {:?}. Use a browser node for HTTPS exits.",
+                service.name,
+                service.transport
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Subcommand, Debug)]
 #[command(rename_all = "kebab-case")]
 enum Command {
@@ -90,7 +141,7 @@ enum Command {
     #[command(about = "Creates a new session secret key.")]
     NewSession(NewSessionCommand),
     #[command(about = "Starts a long-running node daemon.")]
-    Run(RunCommand),
+    Run(Box<RunCommand>),
     #[command(about = "Provides chat room-like functionality on the Rings Network.")]
     Pubsub(PubsubCommand),
     #[command(about = "Connects to a remote peer.", subcommand)]
@@ -215,6 +266,107 @@ struct RunCommand {
         help = "Inbound chunk reassembly memory profile"
     )]
     pub reassembly_profile: ReassemblyProfile,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Advertise this node as an onion relay in the online-node registry",
+        env
+    )]
+    pub advertise_onion_relay: bool,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Publish this node as an onion exit in the application-layer exit registry",
+        env
+    )]
+    pub advertise_onion_exit: bool,
+
+    #[arg(
+        long,
+        value_parser = parse_onion_exit_service,
+        help = "Exit service in name:transport form, e.g. https:https or web:tcp. May be repeated.",
+        env
+    )]
+    pub onion_exit_service: Vec<OnionExitService>,
+
+    #[arg(
+        long,
+        help = "Allow-list target for onion exit policy. May be repeated.",
+        env
+    )]
+    pub onion_exit_allow_target: Vec<String>,
+
+    #[arg(
+        long,
+        help = "Deny-list target for onion exit policy. May be repeated.",
+        env
+    )]
+    pub onion_exit_deny_target: Vec<String>,
+
+    #[arg(long, help = "Maximum onion circuits this exit will serve", env)]
+    pub onion_exit_max_circuits: Option<u32>,
+
+    #[arg(
+        long,
+        help = "Maximum streams per onion circuit this exit will serve",
+        env
+    )]
+    pub onion_exit_max_streams_per_circuit: Option<u32>,
+
+    #[arg(long, help = "Maximum bytes per minute this exit will serve", env)]
+    pub onion_exit_max_bytes_per_minute: Option<u64>,
+
+    #[arg(long, help = "Onion-exit registry heartbeat interval in seconds", env)]
+    pub onion_exit_heartbeat_interval_secs: Option<u64>,
+
+    #[arg(long, help = "Onion-exit registry descriptor TTL in seconds", env)]
+    pub onion_exit_ttl_secs: Option<u64>,
+
+    #[arg(
+        long,
+        help = "Bind a local HTTP CONNECT proxy that routes client TCP streams through onion exits, e.g. 127.0.0.1:18080",
+        env
+    )]
+    pub onion_http_proxy_addr: Option<String>,
+
+    #[arg(
+        long,
+        value_parser = parse_onion_service_name,
+        help = "TCP onion-exit service used by the local HTTP CONNECT proxy, e.g. tcp or web",
+        env
+    )]
+    pub onion_http_proxy_service: Option<OnionServiceName>,
+
+    #[arg(
+        long,
+        help = "Desired hop count for the local onion HTTP proxy. 0 uses node default.",
+        env
+    )]
+    pub onion_http_proxy_hop_count: Option<usize>,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Allow the local onion HTTP proxy to use shorter routes when too few relays are live",
+        env
+    )]
+    pub onion_http_proxy_allow_short_paths: bool,
+
+    #[arg(
+        long,
+        help = "Maximum seconds to wait for one HTTP CONNECT header",
+        env
+    )]
+    pub onion_http_proxy_header_timeout_secs: Option<u64>,
+
+    #[arg(
+        long,
+        help = "Maximum concurrent local HTTP CONNECT proxy connections",
+        env
+    )]
+    pub onion_http_proxy_max_connections: Option<usize>,
 
     #[command(flatten)]
     config_args: ConfigArgs,
@@ -470,8 +622,71 @@ async fn daemon_run(args: RunCommand) -> anyhow::Result<()> {
     if let Some(internal_api_port) = args.internal_api_port {
         c.internal_api_port = internal_api_port;
     }
+    if args.advertise_onion_relay {
+        c.advertise_onion_relay = true;
+    }
+    if args.advertise_onion_exit {
+        c.advertise_onion_exit = true;
+    }
+    if !args.onion_exit_service.is_empty() {
+        c.onion_exit_services = args.onion_exit_service;
+    }
+    if !args.onion_exit_allow_target.is_empty() {
+        c.onion_exit_policy.allowed_targets =
+            parse_onion_exit_targets(args.onion_exit_allow_target)?;
+    }
+    if !args.onion_exit_deny_target.is_empty() {
+        c.onion_exit_policy.denied_targets = parse_onion_exit_targets(args.onion_exit_deny_target)?;
+    }
+    if let Some(max_circuits) = args.onion_exit_max_circuits {
+        c.onion_exit_policy.max_circuits = max_circuits;
+    }
+    if let Some(max_streams_per_circuit) = args.onion_exit_max_streams_per_circuit {
+        c.onion_exit_policy.max_streams_per_circuit = max_streams_per_circuit;
+    }
+    if let Some(max_bytes_per_minute) = args.onion_exit_max_bytes_per_minute {
+        c.onion_exit_policy.max_bytes_per_minute = max_bytes_per_minute;
+    }
+    if let Some(interval_secs) = args.onion_exit_heartbeat_interval_secs {
+        c.onion_exit_heartbeat_interval_secs = interval_secs;
+    }
+    if let Some(ttl_secs) = args.onion_exit_ttl_secs {
+        c.onion_exit_ttl_secs = ttl_secs;
+    }
+    if let Some(addr) = args.onion_http_proxy_addr {
+        c.onion_http_proxy_addr = Some(addr);
+    }
+    if let Some(service) = args.onion_http_proxy_service {
+        c.onion_http_proxy_service = service;
+    }
+    if let Some(hop_count) = args.onion_http_proxy_hop_count {
+        c.onion_http_proxy_hop_count = hop_count;
+    }
+    if args.onion_http_proxy_allow_short_paths {
+        c.onion_http_proxy_allow_short_paths = true;
+    }
+    if let Some(timeout_secs) = args.onion_http_proxy_header_timeout_secs {
+        c.onion_http_proxy_header_timeout_secs = timeout_secs;
+    }
+    if let Some(max_connections) = args.onion_http_proxy_max_connections {
+        c.onion_http_proxy_max_connections = max_connections;
+    }
+    if c.advertise_onion_exit {
+        validate_native_onion_exit_services(&c.onion_exit_services)?;
+    }
 
     let pc = ProcessorConfig::try_from(c.clone())?;
+    let onion_session_sk = pc.session_sk();
+    let advertise_onion_relay = c.advertise_onion_relay;
+    let advertise_onion_exit = c.advertise_onion_exit;
+    let onion_exit_services = c.onion_exit_services.clone();
+    let onion_exit_policy = c.onion_exit_policy.clone();
+    let onion_http_proxy_addr = c.onion_http_proxy_addr.clone();
+    let onion_http_proxy_service = c.onion_http_proxy_service.clone();
+    let onion_http_proxy_hop_count = c.onion_http_proxy_hop_count;
+    let onion_http_proxy_allow_short_paths = c.onion_http_proxy_allow_short_paths;
+    let onion_http_proxy_header_timeout_secs = c.onion_http_proxy_header_timeout_secs;
+    let onion_http_proxy_max_connections = c.onion_http_proxy_max_connections;
 
     let (data_storage, measure_storage) = if let Some(storage_path) = args.storage_path {
         let storage_path = Path::new(&storage_path);
@@ -509,7 +724,17 @@ async fn daemon_run(args: RunCommand) -> anyhow::Result<()> {
     // The relay is an opt-in extension owning its own engine; install it so the daemon can
     // serve TCP/UDP tunnels. The handle is unused server-side — the engine lives on inside the
     // registered interpreters.
-    rings_node::extension::protocols::relay::RelayHandle::install(&provider.extensions())?;
+    let _relay =
+        rings_node::extension::protocols::relay::RelayHandle::install(&provider.extensions())?;
+    let onion_exit_config = advertise_onion_exit
+        .then(|| NativeOnionTcpExitConfig::new(onion_exit_services, onion_exit_policy.clone()))
+        .transpose()?;
+    let onion = NativeOnionCircuitHandle::install(
+        &provider.extensions(),
+        onion_session_sk,
+        advertise_onion_relay,
+        onion_exit_config,
+    )?;
     // SNARK is a namespaced protocol now; register it so the daemon can prove/verify.
     #[cfg(feature = "snark")]
     rings_node::extension::snark::SNARKBehaviour::default().register(provider.as_ref())?;
@@ -520,13 +745,39 @@ async fn daemon_run(args: RunCommand) -> anyhow::Result<()> {
 
     let processor_clone1 = processor.clone();
     let processor_clone2 = processor.clone();
-    let _ = futures::join!(
-        processor.listen(),
-        run_internal_api(c.internal_api_port, processor_clone2),
-        run_external_api(c.external_api_addr, processor_clone1),
-    );
+    if let Some(onion_http_proxy_addr) = onion_http_proxy_addr {
+        let onion_http_proxy_addr = onion_http_proxy_addr.parse::<SocketAddr>()?;
+        let proxy_options = OnionHttpProxyOptions {
+            listen_addr: onion_http_proxy_addr,
+            service: onion_http_proxy_service,
+            hop_count: onion_http_proxy_hop_count,
+            allow_short_paths: onion_http_proxy_allow_short_paths,
+            max_connections: onion_http_proxy_max_connections,
+            header_timeout: Duration::from_secs(onion_http_proxy_header_timeout_secs),
+        };
+        let _ = futures::join!(
+            processor.listen(),
+            run_internal_api(c.internal_api_port, processor_clone2),
+            run_external_api(c.external_api_addr, processor_clone1),
+            run_onion_http_proxy(proxy_options, processor.clone(), onion),
+        );
+    } else {
+        let _ = futures::join!(
+            processor.listen(),
+            run_internal_api(c.internal_api_port, processor_clone2),
+            run_external_api(c.external_api_addr, processor_clone1),
+        );
+    }
 
     Ok(())
+}
+
+fn parse_onion_exit_targets(targets: Vec<String>) -> anyhow::Result<Vec<OnionExitTarget>> {
+    let mut parsed = Vec::with_capacity(targets.len());
+    for target in targets {
+        parsed.push(OnionExitTarget::parse(target)?);
+    }
+    Ok(parsed)
 }
 
 async fn pubsub_run(client_args: ClientArgs, topic: String) -> anyhow::Result<()> {
@@ -567,7 +818,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Run(args) => daemon_run(args).await,
+        Command::Run(args) => daemon_run(*args).await,
         Command::Pubsub(args) => pubsub_run(args.client_args, args.topic).await,
         Command::Connect(ConnectCommand::Node(args)) => {
             args.client_args

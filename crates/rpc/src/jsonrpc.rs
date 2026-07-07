@@ -217,6 +217,22 @@ impl Client {
         self.call_method(Method::LookupOnlineNodes, req).await
     }
 
+    /// Looks up signed onion-exit descriptors.
+    pub async fn lookup_onion_exits(
+        &self,
+        req: &LookupOnionExitsRequest,
+    ) -> Result<LookupOnionExitsResponse> {
+        self.call_method(Method::LookupOnionExits, req).await
+    }
+
+    /// Builds an onion route from live presence and exit descriptors.
+    pub async fn build_onion_route(
+        &self,
+        req: &BuildOnionRouteRequest,
+    ) -> Result<BuildOnionRouteResponse> {
+        self.call_method(Method::BuildOnionRoute, req).await
+    }
+
     /// Query for swarm inspect info.
     pub async fn node_info(&self, req: &NodeInfoRequest) -> Result<NodeInfoResponse> {
         self.call_method(Method::NodeInfo, req).await

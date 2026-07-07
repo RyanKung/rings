@@ -8,7 +8,12 @@ use serde::Serialize;
 
 use crate::error::Error;
 use crate::error::Result;
+use crate::onion::OnionExitPolicy;
+use crate::onion::OnionExitService;
+use crate::onion::OnionServiceName;
 use crate::online::OnlineNodeType;
+use crate::prelude::rings_core::dht::default_storage_virtual_positions_per_owner;
+use crate::prelude::rings_core::dht::DEFAULT_STORAGE_VIRTUAL_POSITIONS_PER_OWNER;
 use crate::prelude::rings_core::ecc::SecretKey;
 use crate::prelude::SessionSk;
 use crate::processor::ProcessorConfig;
@@ -66,6 +71,31 @@ pub struct Config {
     pub online_node_type: OnlineNodeType,
     #[serde(default = "crate::registration::default_advertise_presence")]
     pub advertise_presence: bool,
+    #[serde(default = "crate::onion::default_advertise_onion_relay")]
+    pub advertise_onion_relay: bool,
+    #[serde(default = "crate::onion::default_advertise_onion_exit")]
+    pub advertise_onion_exit: bool,
+    #[serde(default = "crate::onion::default_onion_exit_heartbeat_interval_secs")]
+    pub onion_exit_heartbeat_interval_secs: u64,
+    #[serde(default = "crate::onion::default_onion_exit_ttl_secs")]
+    pub onion_exit_ttl_secs: u64,
+    #[serde(default = "crate::onion::default_onion_exit_services")]
+    pub onion_exit_services: Vec<OnionExitService>,
+    #[serde(default = "crate::onion::default_onion_exit_policy")]
+    pub onion_exit_policy: OnionExitPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onion_http_proxy_addr: Option<String>,
+    #[serde(default = "OnionServiceName::tcp")]
+    pub onion_http_proxy_service: OnionServiceName,
+    #[serde(default)]
+    pub onion_http_proxy_hop_count: usize,
+    #[serde(default)]
+    pub onion_http_proxy_allow_short_paths: bool,
+    #[serde(default = "crate::onion::proxy::http::default_connect_header_timeout_secs")]
+    pub onion_http_proxy_header_timeout_secs: u64,
+    #[serde(default = "crate::onion::proxy::http::default_max_connect_connections")]
+    pub onion_http_proxy_max_connections: usize,
+    #[serde(default = "default_storage_virtual_positions_per_owner")]
     pub dht_virtual_nodes: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_ip: Option<String>,
@@ -110,6 +140,12 @@ impl TryFrom<Config> for ProcessorConfigSerialized {
         .online_node_ttl_secs(config.online_node_ttl_secs)
         .online_node_type(config.online_node_type)
         .advertise_presence(config.advertise_presence)
+        .advertise_onion_relay(config.advertise_onion_relay)
+        .advertise_onion_exit(config.advertise_onion_exit)
+        .onion_exit_heartbeat_interval_secs(config.onion_exit_heartbeat_interval_secs)
+        .onion_exit_ttl_secs(config.onion_exit_ttl_secs)
+        .onion_exit_services(config.onion_exit_services)
+        .onion_exit_policy(config.onion_exit_policy)
         .dht_virtual_nodes(config.dht_virtual_nodes);
 
         cs = if let Some(ext_ip) = config.external_ip {
@@ -157,7 +193,22 @@ impl Config {
             online_node_ttl_secs: crate::registration::default_online_node_ttl_secs(),
             online_node_type: crate::registration::default_online_node_type(),
             advertise_presence: crate::registration::default_advertise_presence(),
-            dht_virtual_nodes: 0,
+            advertise_onion_relay: crate::onion::default_advertise_onion_relay(),
+            advertise_onion_exit: crate::onion::default_advertise_onion_exit(),
+            onion_exit_heartbeat_interval_secs:
+                crate::onion::default_onion_exit_heartbeat_interval_secs(),
+            onion_exit_ttl_secs: crate::onion::default_onion_exit_ttl_secs(),
+            onion_exit_services: crate::onion::default_onion_exit_services(),
+            onion_exit_policy: crate::onion::default_onion_exit_policy(),
+            onion_http_proxy_addr: None,
+            onion_http_proxy_service: OnionServiceName::tcp(),
+            onion_http_proxy_hop_count: 0,
+            onion_http_proxy_allow_short_paths: false,
+            onion_http_proxy_header_timeout_secs:
+                crate::onion::proxy::http::default_connect_header_timeout_secs(),
+            onion_http_proxy_max_connections:
+                crate::onion::proxy::http::default_max_connect_connections(),
+            dht_virtual_nodes: DEFAULT_STORAGE_VIRTUAL_POSITIONS_PER_OWNER,
             external_ip: None,
             webrtc_udp_port_min: None,
             webrtc_udp_port_max: None,
@@ -230,7 +281,6 @@ external_api_addr: 127.0.0.1:50001
 endpoint_url: http://127.0.0.1:50000
 ice_servers: stun://stun.l.google.com:19302
 stabilize_interval: 3
-dht_virtual_nodes: 0
 external_ip: null
 webrtc_udp_port_min: null
 webrtc_udp_port_max: null
@@ -243,11 +293,33 @@ measure_storage:
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.network_id, 1);
+        assert_eq!(
+            cfg.dht_virtual_nodes,
+            DEFAULT_STORAGE_VIRTUAL_POSITIONS_PER_OWNER
+        );
         assert!(cfg.advertise_presence);
+        assert!(!cfg.advertise_onion_relay);
+        assert!(!cfg.advertise_onion_exit);
+        assert_eq!(cfg.onion_http_proxy_addr, None);
+        assert_eq!(cfg.onion_http_proxy_service, OnionServiceName::tcp());
+        assert_eq!(cfg.onion_http_proxy_hop_count, 0);
+        assert!(!cfg.onion_http_proxy_allow_short_paths);
+        assert_eq!(
+            cfg.onion_http_proxy_header_timeout_secs,
+            crate::onion::proxy::http::default_connect_header_timeout_secs()
+        );
+        assert_eq!(
+            cfg.onion_http_proxy_max_connections,
+            crate::onion::proxy::http::default_max_connect_connections()
+        );
+        assert_eq!(
+            cfg.onion_exit_services,
+            crate::onion::default_onion_exit_services()
+        );
     }
 
     #[test]
-    fn deserialization_requires_dht_virtual_nodes() {
+    fn deserialization_preserves_explicit_disabled_dht_virtual_nodes() {
         let yaml = r#"
 network_id: 1
 session_sk: session_sk
@@ -256,6 +328,7 @@ external_api_addr: 127.0.0.1:50001
 endpoint_url: http://127.0.0.1:50000
 ice_servers: stun://stun.l.google.com:19302
 stabilize_interval: 3
+dht_virtual_nodes: 0
 external_ip: null
 webrtc_udp_port_min: null
 webrtc_udp_port_max: null
@@ -267,12 +340,9 @@ measure_storage:
   capacity: 200000000
 "#;
 
-        let result = serde_yaml::from_str::<Config>(yaml);
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
 
-        assert!(matches!(
-            result,
-            Err(error) if error.to_string().contains("dht_virtual_nodes")
-        ));
+        assert_eq!(cfg.dht_virtual_nodes, 0);
     }
 
     #[test]

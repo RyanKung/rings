@@ -1,10 +1,8 @@
 #![warn(missing_docs)]
 //! Signed online-node descriptors stored in the DHT.
 
-use std::collections::btree_map::Entry;
-use std::collections::BTreeMap;
-
 use rings_core::dht::Did;
+use rings_core::ecc::PublicKey;
 use rings_core::ecc::VerificationPublicKey;
 use rings_core::error::Error;
 use rings_core::error::Result;
@@ -16,6 +14,13 @@ use rings_core::message::MessageVerification;
 use rings_core::session::SessionSk;
 use serde::Deserialize;
 use serde::Serialize;
+
+use crate::descriptor::decode_descriptor;
+use crate::descriptor::encode_descriptor;
+use crate::descriptor::latest_valid_by_did;
+use crate::descriptor::sign_descriptor_body;
+use crate::descriptor::SignedDescriptor;
+use crate::descriptor::SignedDescriptorBody;
 
 /// DHT topic used for online-node registry descriptors.
 pub const ONLINE_NODES_TOPIC: &str = "online_nodes";
@@ -42,6 +47,8 @@ pub struct OnlineNodeDescriptorBody {
     pub did: Did,
     /// Account public key corresponding to `did`.
     pub public_key: VerificationPublicKey,
+    /// Session public key used for encrypted onion relay frames.
+    pub session_public_key: PublicKey<33>,
     /// Runtime family of this node.
     pub node_type: OnlineNodeType,
     /// Network identifier.
@@ -65,19 +72,11 @@ pub struct OnlineNodeDescriptorBody {
 }
 
 impl OnlineNodeDescriptorBody {
-    fn validate_signer(&self, session_sk: &SessionSk) -> Result<()> {
-        if self.public_key.did() != self.did || session_sk.account_did() != self.did {
-            return Err(Error::InvalidMessage(
-                "online node descriptor DID/public key/session mismatch".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     fn body_ref(&self) -> OnlineNodeDescriptorBodyRef<'_> {
         OnlineNodeDescriptorBodyRef {
             did: self.did,
             public_key: &self.public_key,
+            session_public_key: &self.session_public_key,
             node_type: &self.node_type,
             network_id: self.network_id,
             storage_redundancy: self.storage_redundancy,
@@ -96,10 +95,46 @@ impl OnlineNodeDescriptorBody {
     }
 }
 
+impl SignedDescriptorBody for OnlineNodeDescriptorBody {
+    type Descriptor = OnlineNodeDescriptor;
+
+    fn body_did(&self) -> Did {
+        self.did
+    }
+
+    fn body_public_key(&self) -> &VerificationPublicKey {
+        &self.public_key
+    }
+
+    fn body_signing_data(&self) -> Result<Vec<u8>> {
+        self.signing_data()
+    }
+
+    fn into_signed_descriptor(self, signature: MessageVerification) -> Self::Descriptor {
+        OnlineNodeDescriptor {
+            did: self.did,
+            public_key: self.public_key,
+            session_public_key: self.session_public_key,
+            node_type: self.node_type,
+            network_id: self.network_id,
+            storage_redundancy: self.storage_redundancy,
+            dht_virtual_nodes: self.dht_virtual_nodes,
+            capabilities: self.capabilities,
+            endpoint_hint: self.endpoint_hint,
+            started_at_ms: self.started_at_ms,
+            heartbeat_at_ms: self.heartbeat_at_ms,
+            expires_at_ms: self.expires_at_ms,
+            version: self.version,
+            signature,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct OnlineNodeDescriptorBodyRef<'a> {
     did: Did,
     public_key: &'a VerificationPublicKey,
+    session_public_key: &'a PublicKey<33>,
     node_type: &'a OnlineNodeType,
     network_id: u32,
     storage_redundancy: u16,
@@ -125,6 +160,8 @@ pub struct OnlineNodeDescriptor {
     pub did: Did,
     /// Account public key corresponding to `did`.
     pub public_key: VerificationPublicKey,
+    /// Session public key used for encrypted onion relay frames.
+    pub session_public_key: PublicKey<33>,
     /// Runtime family of this node.
     pub node_type: OnlineNodeType,
     /// Network identifier.
@@ -152,29 +189,18 @@ pub struct OnlineNodeDescriptor {
 impl OnlineNodeDescriptor {
     /// Create and sign a descriptor.
     pub fn new_signed(body: OnlineNodeDescriptorBody, session_sk: &SessionSk) -> Result<Self> {
-        body.validate_signer(session_sk)?;
-        let signature = MessageVerification::new(&body.signing_data()?, session_sk)?;
-        Ok(Self {
-            did: body.did,
-            public_key: body.public_key,
-            node_type: body.node_type,
-            network_id: body.network_id,
-            storage_redundancy: body.storage_redundancy,
-            dht_virtual_nodes: body.dht_virtual_nodes,
-            capabilities: body.capabilities,
-            endpoint_hint: body.endpoint_hint,
-            started_at_ms: body.started_at_ms,
-            heartbeat_at_ms: body.heartbeat_at_ms,
-            expires_at_ms: body.expires_at_ms,
-            version: body.version,
-            signature,
-        })
+        sign_descriptor_body(
+            body,
+            session_sk,
+            "online node descriptor DID/public key/session mismatch",
+        )
     }
 
     fn body_ref(&self) -> OnlineNodeDescriptorBodyRef<'_> {
         let Self {
             did,
             public_key,
+            session_public_key,
             node_type,
             network_id,
             storage_redundancy,
@@ -191,6 +217,7 @@ impl OnlineNodeDescriptor {
         OnlineNodeDescriptorBodyRef {
             did: *did,
             public_key,
+            session_public_key,
             node_type,
             network_id: *network_id,
             storage_redundancy: *storage_redundancy,
@@ -229,31 +256,17 @@ impl OnlineNodeDescriptor {
     /// signed `expires_at_ms` descriptor field; use [`Self::is_live_at`] when
     /// expiry should be enforced.
     pub fn verify_signature(&self) -> bool {
-        if self.public_key.did() != self.did || self.signature.session.account_did() != self.did {
-            return false;
-        }
-
-        let Ok(session_public_key) = self.signature.session.account_verification_pubkey() else {
-            return false;
-        };
-        if session_public_key != self.public_key {
-            return false;
-        }
-
-        let Ok(data) = self.signing_data() else {
-            return false;
-        };
-        self.signature.verify(&data)
+        self.descriptor_verify_signature()
     }
 
     /// Returns whether this descriptor is expired at `now_ms`.
     pub fn is_expired_at(&self, now_ms: u128) -> bool {
-        self.expires_at_ms < now_ms
+        self.descriptor_is_expired_at(now_ms)
     }
 
     /// Returns whether this descriptor has a valid signature and is not expired.
     pub fn is_live_at(&self, now_ms: u128) -> bool {
-        self.verify_signature() && !self.is_expired_at(now_ms)
+        self.descriptor_is_live_at(now_ms)
     }
 
     /// Select the newest valid descriptor per DID.
@@ -262,42 +275,45 @@ impl OnlineNodeDescriptor {
         now_ms: u128,
         include_expired: bool,
     ) -> Vec<Self> {
-        let mut latest = BTreeMap::<Did, Self>::new();
-        for descriptor in descriptors {
-            if include_expired {
-                if !descriptor.verify_signature() {
-                    continue;
-                }
-            } else if !descriptor.is_live_at(now_ms) {
-                continue;
-            }
-            match latest.entry(descriptor.did) {
-                Entry::Occupied(mut entry) => {
-                    if descriptor.heartbeat_at_ms > entry.get().heartbeat_at_ms {
-                        entry.insert(descriptor);
-                    }
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(descriptor);
-                }
-            }
-        }
-        latest.into_values().collect()
+        latest_valid_by_did(descriptors, now_ms, include_expired)
+    }
+}
+
+impl SignedDescriptor for OnlineNodeDescriptor {
+    fn descriptor_did(&self) -> Did {
+        self.did
+    }
+
+    fn descriptor_public_key(&self) -> &VerificationPublicKey {
+        &self.public_key
+    }
+
+    fn descriptor_signature(&self) -> &MessageVerification {
+        &self.signature
+    }
+
+    fn descriptor_heartbeat_at_ms(&self) -> u128 {
+        self.heartbeat_at_ms
+    }
+
+    fn descriptor_expires_at_ms(&self) -> u128 {
+        self.expires_at_ms
+    }
+
+    fn descriptor_signing_data(&self) -> Result<Vec<u8>> {
+        self.signing_data()
     }
 }
 
 impl Encoder for OnlineNodeDescriptor {
     fn encode(&self) -> Result<Encoded> {
-        bincode::serialize(self)
-            .map_err(Error::BincodeSerialize)?
-            .encode()
+        encode_descriptor(self)
     }
 }
 
 impl Decoder for OnlineNodeDescriptor {
     fn from_encoded(encoded: &Encoded) -> Result<Self> {
-        let data: Vec<u8> = encoded.decode()?;
-        bincode::deserialize(&data).map_err(Error::BincodeDeserialize)
+        decode_descriptor(encoded)
     }
 }
 
@@ -316,6 +332,7 @@ mod tests {
             OnlineNodeDescriptorBody {
                 did,
                 public_key: session_sk.session().account_verification_pubkey()?,
+                session_public_key: session_sk.session_public_key(),
                 node_type: OnlineNodeType::Native,
                 network_id: 1,
                 storage_redundancy: 6,
@@ -366,6 +383,7 @@ mod tests {
             OnlineNodeDescriptorBody {
                 did,
                 public_key: public_key.clone(),
+                session_public_key: session_sk.session_public_key(),
                 node_type: OnlineNodeType::Native,
                 network_id: 1,
                 storage_redundancy: 6,
@@ -383,6 +401,7 @@ mod tests {
             OnlineNodeDescriptorBody {
                 did,
                 public_key,
+                session_public_key: session_sk.session_public_key(),
                 node_type: OnlineNodeType::Native,
                 network_id: 1,
                 storage_redundancy: 6,

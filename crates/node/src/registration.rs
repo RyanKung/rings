@@ -165,18 +165,33 @@ impl DhtRegistrationPublisher {
 
     /// Publish `value`, tombstoning older values previously published by this publisher.
     pub async fn publish(&self, context: &RegistrationContext<'_>, value: Encoded) -> Result<()> {
+        self.publish_many(context, std::iter::once(value)).await
+    }
+
+    /// Publish the current value set, tombstoning older values previously published by this publisher.
+    ///
+    /// Invariant: after a successful call, DHT data previously emitted by this publisher is exactly
+    /// `values`. Preservation: every stale local value is tombstoned after every current value is
+    /// touched under the same publisher serialization lock.
+    pub async fn publish_many(
+        &self,
+        context: &RegistrationContext<'_>,
+        values: impl IntoIterator<Item = Encoded>,
+    ) -> Result<()> {
+        let current_values = values.into_iter().collect::<BTreeSet<_>>();
         let mut published_values = self.published_values.lock().await;
         let stale_values = published_values
             .iter()
-            .filter(|published| *published != &value)
+            .filter(|published| !current_values.contains(*published))
             .cloned()
             .collect::<Vec<_>>();
 
-        context
-            .processor
-            .storage_touch_data(&self.topic, value.clone())
-            .await?;
-        published_values.insert(value);
+        for value in &current_values {
+            context
+                .processor
+                .storage_touch_data(&self.topic, value.clone())
+                .await?;
+        }
         for stale_value in stale_values {
             context
                 .processor
@@ -184,6 +199,7 @@ impl DhtRegistrationPublisher {
                 .await?;
             published_values.remove(&stale_value);
         }
+        *published_values = current_values;
         Ok(())
     }
 }
@@ -210,6 +226,7 @@ pub struct OnlineNodeRegistration {
     node_type: OnlineNodeType,
     started_at_ms: u128,
     endpoint_hint: Option<String>,
+    additional_capabilities: Vec<String>,
     publisher: DhtRegistrationPublisher,
 }
 
@@ -220,6 +237,7 @@ impl OnlineNodeRegistration {
         ttl: Duration,
         node_type: OnlineNodeType,
         endpoint_hint: Option<String>,
+        additional_capabilities: Vec<String>,
     ) -> Self {
         Self {
             heartbeat_interval,
@@ -227,6 +245,7 @@ impl OnlineNodeRegistration {
             node_type,
             started_at_ms: get_epoch_ms(),
             endpoint_hint,
+            additional_capabilities,
             publisher: DhtRegistrationPublisher::new(ONLINE_NODES_TOPIC),
         }
     }
@@ -237,7 +256,7 @@ impl OnlineNodeRegistration {
     }
 
     /// Return capability labels advertised by online-node descriptors.
-    pub fn capabilities() -> Vec<String> {
+    pub fn default_capabilities() -> Vec<String> {
         let capabilities = vec![ONLINE_NODE_CAPABILITY_STORAGE.to_string()];
         #[cfg(feature = "snark")]
         let capabilities = {
@@ -245,6 +264,17 @@ impl OnlineNodeRegistration {
             capabilities.push(ONLINE_NODE_CAPABILITY_SNARK.to_string());
             capabilities
         };
+        capabilities
+    }
+
+    /// Return capability labels advertised by this registration.
+    pub fn capabilities(&self) -> Vec<String> {
+        let mut capabilities = Self::default_capabilities();
+        for capability in &self.additional_capabilities {
+            if !capabilities.iter().any(|known| known == capability) {
+                capabilities.push(capability.clone());
+            }
+        }
         capabilities
     }
 
@@ -258,11 +288,12 @@ impl OnlineNodeRegistration {
             OnlineNodeDescriptorBody {
                 did: context.did(),
                 public_key: context.account_verification_pubkey()?,
+                session_public_key: context.session_sk().session_public_key(),
                 node_type: self.node_type.clone(),
                 network_id: context.network_id(),
                 storage_redundancy: context.storage_redundancy(),
                 dht_virtual_nodes: context.dht_virtual_nodes(),
-                capabilities: Self::capabilities(),
+                capabilities: self.capabilities(),
                 endpoint_hint: self.endpoint_hint.clone(),
                 started_at_ms: self.started_at_ms,
                 heartbeat_at_ms: now_ms,

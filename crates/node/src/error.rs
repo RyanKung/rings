@@ -1,4 +1,5 @@
 //! A bunch of wrap errors.
+use crate::onion::OnionRouteError;
 use crate::prelude::rings_core;
 
 /// A wrap `Result` contains custom errors.
@@ -147,6 +148,10 @@ pub enum Error {
     BackendError(String) = 1501,
     #[error("Extension error: {0}")]
     ExtensionError(String) = 1502,
+    #[error("Onion route error: {0}")]
+    OnionRouteError(OnionRouteError) = 1601,
+    #[error("Onion proxy IO error: {0}")]
+    OnionProxyIoError(String) = 1602,
 }
 
 impl Error {

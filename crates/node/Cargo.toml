@@ -85,6 +85,7 @@ futures-timer = "3.0.2"
 http = "0.2.6"
 jsonrpc-core = { workspace = true }
 log = { version = "0.4", features = ["std"] }
+rand = { version = "0.8.5", features = ["getrandom"] }
 rings-core = { workspace = true, optional = true }
 rings-derive = { workspace = true, optional = true }
 rings-rpc = { workspace = true, optional = true }

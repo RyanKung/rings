@@ -17,7 +17,7 @@
 //!   Successors(n) = the K closest forward nodes of `known[n]`
 //!   Predecessor(n) = the closest node behind n among those that notify it
 //!   Finger(n,k)   = the no-wrap finger rule over `known[n]`
-//! This is exactly `MODULE ChordConvergence` (dht_convergence.rs) evaluated at a
+//! This is exactly `MODULE ChordConvergence` (test_dht_convergence.rs) evaluated at a
 //! given `known[n]`. `known[n]` only grows (connections are not dropped on the
 //! happy path) and, for these six fully-discoverable DIDs, converges to "all
 //! other nodes". Once `known[n]` = all, those three functions each evaluate to a
@@ -308,6 +308,7 @@ mod tests {
         let swarm = Arc::new(
             SwarmBuilder::new(0, stun, storage, session_sk)
                 .dht_finger_table_size(SCHEDULE_FINGER_TABLE_SIZE)
+                .dht_virtual_nodes(0)
                 .build(),
         );
 
@@ -329,7 +330,7 @@ mod tests {
 
     /// The unique converged DHT each node must reach, built via the production
     /// join/notify path over the full DID set — the same fixpoint checked by
-    /// `dht_convergence`.
+    /// `test_dht_convergence`.
     fn expected_dhts(swarms: &[Arc<Swarm>]) -> Vec<DHTInspect> {
         swarms
             .iter()

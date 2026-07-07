@@ -4,6 +4,8 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(feature = "browser")]
+use std::sync::Mutex;
 
 use rings_core::dht::Did;
 use rings_core::dht::EntryStorage;
@@ -39,6 +41,8 @@ pub struct Provider {
     processor: Arc<Processor>,
     handler: InternalRpcHandler,
     extensions: crate::extension::ext::Extensions,
+    #[cfg(feature = "browser")]
+    onion_https_runtime: Arc<Mutex<Option<Arc<crate::onion::https::OnionHttpsRuntime>>>>,
 }
 
 /// Async signer, without Send required
@@ -67,6 +71,8 @@ impl Provider {
             processor,
             handler: InternalRpcHandler,
             extensions,
+            #[cfg(feature = "browser")]
+            onion_https_runtime: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -141,6 +147,8 @@ impl Provider {
             processor,
             handler: InternalRpcHandler,
             extensions,
+            #[cfg(feature = "browser")]
+            onion_https_runtime: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -163,6 +171,32 @@ impl Provider {
         entry_storage: Option<EntryStorage>,
         measure_storage: Option<MeasureStorage>,
     ) -> Result<Provider> {
+        Self::new_provider_internal_with_config(
+            network_id,
+            ice_servers,
+            stabilize_interval,
+            account,
+            account_type,
+            signer,
+            entry_storage,
+            measure_storage,
+            core::convert::identity,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn new_provider_internal_with_config(
+        network_id: u32,
+        ice_servers: String,
+        stabilize_interval: u64,
+        account: String,
+        account_type: String,
+        signer: Signer,
+        entry_storage: Option<EntryStorage>,
+        measure_storage: Option<MeasureStorage>,
+        configure: impl FnOnce(ProcessorConfig) -> ProcessorConfig,
+    ) -> Result<Provider> {
         let mut sk_builder = SessionSkBuilder::new(account, account_type);
         let proof = sk_builder.unsigned_proof();
         let sig = match signer {
@@ -172,6 +206,7 @@ impl Provider {
         sk_builder = sk_builder.set_session_sig(sig.to_vec());
         let session_sk = sk_builder.build().map_err(Error::InternalError)?;
         let config = ProcessorConfig::new(network_id, ice_servers, session_sk, stabilize_interval);
+        let config = configure(config);
         Self::new_provider_with_storage_internal(config, entry_storage, measure_storage).await
     }
 
